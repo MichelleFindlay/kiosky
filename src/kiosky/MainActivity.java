@@ -74,10 +74,12 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle state) {
         super.onCreate(state);
 
-        // Keep the screen on (wall-panel use)
-        getWindow().addFlags(128 /* FLAG_KEEP_SCREEN_ON */);
+        // Keep the screen on while Kiosky is in front (wall-panel use). Set on both the
+        // window and the root view, so it holds even if one of them is replaced.
+        keepScreenOn();
 
         FrameLayout root = new FrameLayout(this);
+        root.setKeepScreenOn(true);
 
         web = new WebView(this);
         WebSettings s = web.getSettings();
@@ -394,6 +396,10 @@ public class MainActivity extends Activity {
         web.requestFocus();
     }
 
+    private void keepScreenOn() {
+        getWindow().addFlags(128 /* FLAG_KEEP_SCREEN_ON */);
+    }
+
     private void goImmersive() {
         // LAYOUT_STABLE | LAYOUT_HIDE_NAV | LAYOUT_FULLSCREEN | HIDE_NAV | FULLSCREEN | IMMERSIVE
         // Non-sticky immersive, so an edge swipe tells the app the bars are showing
@@ -410,6 +416,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        keepScreenOn(); // re-apply after returning from Settings or the install screen
         goImmersive();
         if (web != null) web.onResume();
     }
