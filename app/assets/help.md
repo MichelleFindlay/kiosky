@@ -36,6 +36,8 @@ the web page instead.
 | **Update** | Checks for a newer version of Kiosky |
 | **Start on boot** | Turns opening Kiosky automatically at start-up on or off |
 | **Enroll** | Hands this tablet to a Shepherd management server (see below) |
+| **Lockdown** | Locks the tablet to Kiosky, so the system menus and buttons can't be used to leave |
+| **Remove device owner** | Undoes device owner setup (only shown when lockdown is off) |
 | **✕** | Hides the toolbar |
 
 The toolbar hides itself after 15 seconds unless you're typing in it.
@@ -79,6 +81,49 @@ Huawei and Oppo) also have their own *Autostart* setting that has to be turned o
 for Kiosky.
 
 Tap the button again to turn it off.
+
+## Lock the tablet down
+
+Normally, anyone can pull down the notification shade or press Home to leave
+Kiosky. **Lockdown** stops that: Kiosky's own menu becomes the only way out.
+
+1. Open the toolbar and tap **Lockdown: Off**.
+2. Swipe in from an edge to open Kiosky's menu at any time, and tap **Lockdown:
+   On** to unlock again. If a swipe shows nothing, **tap the top-left corner five
+   times quickly** to open the menu instead.
+
+How strong the lock is depends on whether Kiosky is the tablet's *device owner*.
+
+| | Device owner | Not device owner |
+| --- | --- | --- |
+| Notification shade, Home, Recents | Blocked | Blocked |
+| Power menu and lock screen | Blocked | Still work |
+| Leaving without Kiosky's menu | Not possible | Hold **Back** and **Recents** to unpin |
+| Updates | Install without a prompt | Android asks to confirm |
+
+Without device owner, Kiosky uses Android's *app pinning*. Turn on **Ask for PIN
+before unpinning** (Settings › Security › App pinning) so people can't just unpin
+it.
+
+### Make Kiosky the device owner
+
+This is done once per tablet, from a computer with
+[adb](https://developer.android.com/tools/adb):
+
+1. On the tablet, remove every account in Settings › Accounts (Android refuses
+   while any account is signed in). You can add them back afterwards.
+2. Turn on **USB debugging** (Settings › About › tap *Build number* seven times,
+   then Settings › Developer options).
+3. Connect the tablet and run:
+   `adb shell dpm set-device-owner uk.lp0.ha/kiosky.AdminReceiver`
+4. Open Kiosky and turn on **Lockdown**. The button reads **Lockdown: On**
+   instead of **Lockdown: On (pinned)**.
+
+> A device owner can't be uninstalled. To remove Kiosky later, turn Lockdown off
+> and tap **Remove device owner** first, or factory-reset the tablet.
+
+On a tablet managed by Shepherd, **Lockdown** and **Remove device owner** only
+appear after the technician PIN.
 
 ## Managed tablets (Shepherd)
 
@@ -143,8 +188,7 @@ missing permissions. After five wrong PINs, PIN entry is locked for 5 minutes.
 
 ## Tips for a wall-mounted tablet
 
-- **Keep people in Kiosky:** turn on Android's *App pinning* (often under
-  Settings › Security) and pin Kiosky.
+- **Keep people in Kiosky:** turn on **Lockdown** (see *Lock the tablet down*).
 - **Stop Android closing it:** set Kiosky's battery use to *Unrestricted* in
   Settings › Apps › Kiosky › Battery.
 - **Leave it charging.** The screen stays on, so it uses more power than usual.

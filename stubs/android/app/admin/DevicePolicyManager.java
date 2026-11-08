@@ -1,0 +1,3 @@
+package android.app.admin; public class DevicePolicyManager {
+ public boolean isDeviceOwnerApp(String p){return false;} public void setLockTaskPackages(android.content.ComponentName a,String[] p){}
+ public void setLockTaskFeatures(android.content.ComponentName a,int f){} public void clearDeviceOwnerApp(String p){} }
