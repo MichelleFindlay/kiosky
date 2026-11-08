@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Builds ha-lp0.apk without the Android SDK.
+# Builds kiosky.apk without the Android SDK.
 # Needs: JDK 11+ (javac, jar), curl, unzip. Tools are fetched from GitHub on first run.
 set -euo pipefail
 
 P="$(cd "$(dirname "$0")" && pwd)"
 T="$P/.tools"
-KS="$P/ha-lp0.keystore"
+KS="$P/kiosky.keystore"
 KS_ALIAS="ha"
 KS_PASS="halp0kiosk"
 
@@ -36,13 +36,13 @@ java -jar "$T/apktool.jar" b -f "$P/app" -o "$P/build/unsigned.apk"
 # Signing key (created once; keep it, updates must use the same key)
 if [ ! -f "$KS" ]; then
   keytool -genkeypair -keystore "$KS" -alias "$KS_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
-    -storepass "$KS_PASS" -keypass "$KS_PASS" -dname "CN=ha.lp0.uk"
+    -storepass "$KS_PASS" -keypass "$KS_PASS" -dname "CN=kiosky"
 fi
 
 # zipalign + v1/v2/v3 signature
 java -jar "$T/signer.jar" -a "$P/build/unsigned.apk" -o "$P/build/out" \
   --ks "$KS" --ksAlias "$KS_ALIAS" --ksPass "$KS_PASS" --ksKeyPass "$KS_PASS"
 
-cp "$P"/build/out/*.apk "$P/ha-lp0.apk"
+cp "$P"/build/out/*.apk "$P/kiosky.apk"
 rm -f "$P/app/classes.dex"
-echo "Built $P/ha-lp0.apk"
+echo "Built $P/kiosky.apk"

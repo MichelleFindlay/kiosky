@@ -1,5 +1,5 @@
 version: 2.10.0
-apkFileName: ha-lp0.apk
+apkFileName: kiosky.apk
 isFrameworkApk: false
 usesFramework:
   ids:
@@ -12,8 +12,8 @@ packageInfo:
   forcedPackageId: 127
   renameManifestPackage: null
 versionInfo:
-  versionCode: 2
-  versionName: 1.1
+  versionCode: 10000
+  versionName: 1.0.0
 doNotCompress:
 - resources.arsc
 - png
