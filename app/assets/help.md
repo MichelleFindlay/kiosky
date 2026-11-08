@@ -35,6 +35,7 @@ the web page instead.
 | **Help** | Shows this page (your saved address isn't changed) |
 | **Update** | Checks for a newer version of Kiosky |
 | **Start on boot** | Turns opening Kiosky automatically at start-up on or off |
+| **Enroll** | Hands this tablet to a Shepherd management server (see below) |
 | **✕** | Hides the toolbar |
 
 The toolbar hides itself after 15 seconds unless you're typing in it.
@@ -78,6 +79,51 @@ Huawei and Oppo) also have their own *Autostart* setting that has to be turned o
 for Kiosky.
 
 Tap the button again to turn it off.
+
+## Managed tablets (Shepherd)
+
+An organisation can run a **Kiosky Shepherd** server to look after many tablets at
+once. Once a tablet is enrolled, the server chooses its page and settings, and the
+tablet reports back how it's doing. The tablet's own controls are locked.
+
+### Enroll a tablet
+
+You need an enrollment code from your administrator. Any one of these works:
+
+- **Scan the QR code** with the tablet's camera app and open the link, or
+- open the **enrollment link** on the tablet, or
+- open the toolbar, tap **Enroll**, and type the **server** address and the
+  **code** (dashes and capitals don't matter). **Scan QR** uses a scanner app
+  if one is installed.
+
+Kiosky asks you to confirm before handing the tablet over. A tablet that's
+already managed ignores enrollment links and codes.
+
+### What changes once it's managed
+
+- The server sets the page. If it hasn't chosen one yet, Kiosky shows
+  *Waiting for configuration*.
+- The toolbar may be hidden completely or show only **Reload** and **Help**,
+  depending on what the administrator chose. **Update**, **Start on boot** and
+  **Enroll** disappear.
+- Only sites the administrator allows can open.
+- Updates, start on boot, screen orientation, text size and similar settings
+  come from the server.
+- The server can reload the page, show a message, take a screenshot, clear
+  sign-ins or restart Kiosky.
+- Kiosky reports the page it's showing, any loading errors, battery, Wi-Fi
+  signal and whether start-on-boot and update permissions are granted.
+
+If the tablet loses contact with the server, it keeps its last settings and
+stays locked. It's released only when the administrator removes it in Shepherd.
+Kiosky then shows *This tablet is no longer managed* and keeps its current page.
+
+### Technician PIN
+
+If the administrator set a PIN, tap the **top-left corner** of the screen five
+times quickly, then enter the PIN. The full toolbar opens until it next hides,
+with **Device info** (server, device name, last check-in) and buttons to grant
+missing permissions. After five wrong PINs, PIN entry is locked for 5 minutes.
 
 ## Good to know
 

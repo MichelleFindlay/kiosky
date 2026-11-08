@@ -19,6 +19,21 @@ The app checks `https://api.github.com/repos/MichelleFindlay/kiosky/releases/lat
 
 Drafts and pre-releases are ignored. Updates must be signed with `kiosky.keystore`, or Android refuses them.
 
+## Shepherd management
+
+Kiosky can be managed by a [Kiosky Shepherd](https://github.com/MichelleFindlay/kiosky-shepherd) server, following that repo's `docs/PROTOCOL.md` (version 1). The client lives in `src/kiosky/`:
+
+| File | Role |
+| --- | --- |
+| `Shepherd.java` | Enrollment, the check-in loop with backoff, command dispatch and result delivery |
+| `Policy.java` | The server's policy with protocol defaults, and `allowed_hosts` matching |
+| `ManagedState.java` | The `managed` preferences: token, cached policy, queued events, finished commands |
+| `Pin.java` | Technician PIN check (PBKDF2-HMAC-SHA256, implemented on `HmacSHA256` so it works below Android 8) |
+| `DeviceInfo.java` | Enrollment device facts and the check-in status report |
+| `MainActivity.java` | Enforces the policy: toolbar modes, PIN unlock, navigation blocking, commands, server-chosen updates |
+
+Enrollment links (`kiosky://enroll?server=…&token=…`) open Kiosky directly. Managed mode ends only when the server answers `410 device_retired`.
+
 ## Credits
 
 Built without the Android SDK, using:

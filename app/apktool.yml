@@ -12,8 +12,8 @@ packageInfo:
   forcedPackageId: 127
   renameManifestPackage: null
 versionInfo:
-  versionCode: 10002
-  versionName: 1.0.2
+  versionCode: 10100
+  versionName: 1.1.0
 doNotCompress:
 - resources.arsc
 - png

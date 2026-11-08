@@ -1,19 +1,27 @@
 package kiosky;
 
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
-import android.provider.Settings;
+import android.util.Base64;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.inputmethod.InputMethodManager;
 import android.webkit.CookieManager;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
+import android.webkit.WebStorage;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
@@ -23,40 +31,77 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
 
 public class MainActivity extends Activity {
 
-    // Bundled instructions (app/assets/help.md), shown until an address is set
-    private static final String HELP_URL = "file:///android_asset/help.md";
-    private static final String DEFAULT_URL = HELP_URL;
     static final String PREFS = "kiosk"; // also read by BootReceiver
     private static final String KEY_URL = "url";
     static final String KEY_BOOT = "start_on_boot";
+    private static final String DEFAULT_URL = Pages.HELP_URL; // instructions until an address is set
     private static final long RETRY_MS = 10000L;
     private static final long BAR_TIMEOUT_MS = 15000L;
     private static final long FIRST_CHECK_MS = 60 * 1000L;          // let Wi-Fi settle after launch
     private static final long CHECK_EVERY_MS = 12 * 60 * 60 * 1000L;
+    private static final long HOUR_MS = 60 * 60 * 1000L;
+    private static final int REQ_SCAN = 42;
+    private static final int MAX_PIN_TRIES = 5;
+    private static final long PIN_LOCKOUT_MS = 5 * 60 * 1000L;
 
-    private WebView web;
-    private LinearLayout urlBar;
-    private EditText urlField;
     private final Handler handler = new Handler();
 
+    private FrameLayout root;
+    private WebView web;
+    private String defaultUserAgent;
+
+    // Toolbar
+    private LinearLayout urlBar;
+    private EditText urlField;
+    private TextView mgmtStatus;
+    private Button goButton, updateButton, bootToggle, enrollButton, infoButton, overlayButton, installButton;
+
+    // Update bar
     private Updater updater;
     private LinearLayout updateBar;
     private TextView updateText;
     private Button updateInstall;
-    private Button bootToggle;
-    private String updateVersion, updateUrl, dismissedVersion;
+    private String updateVersion, updateUrl, updateAuth, updateSha, dismissedVersion;
     private long updateSize;
+    private int updateCode, failedCode;
+    private long failedAt;
+
+    // Management
+    private ManagedState managed;
+    private Shepherd shepherd;
+    private Policy policy;            // null while unmanaged
+    private boolean unlocked;         // technician PIN entered; until the toolbar hides
+    private String tempHost;          // host of an admin-sent or technician address, exempt from allowed_hosts
+    private boolean onTemporaryPage;  // a typed or sent address that isn't the start page
+    private View corner;
+    private final long[] cornerTaps = new long[5];
+    private int pinFails;
+    private long pinLockedUntil;
+    private View overlay;
+
+    // Page state, for status reports and events
+    private String pageError;
+    private boolean errorThisLoad;
+    private String lastLoadedUrl, lastErrorKey;
 
     private final Runnable autoCheck = new Runnable() {
         public void run() {
-            updater.check(false);
-            handler.postDelayed(autoCheck, CHECK_EVERY_MS);
+            long next = CHECK_EVERY_MS;
+            if (policy == null) {
+                updater.check(false);
+            } else if ("github".equals(policy.updateSource)) {
+                updater.check(false);
+                next = policy.checkHours * HOUR_MS;
+            } else {
+                next = HOUR_MS; // look again later in case the policy switches to github
+            }
+            handler.postDelayed(autoCheck, next);
         }
     };
 
@@ -66,105 +111,259 @@ public class MainActivity extends Activity {
         }
     };
 
+    private final Runnable periodicReload = new Runnable() {
+        public void run() {
+            if (web == null || policy == null || policy.reloadMinutes <= 0) return;
+            web.reload();
+            handler.postDelayed(periodicReload, policy.reloadMinutes * 60000L);
+        }
+    };
+
     private final Runnable autoHide = new Runnable() {
         public void run() {
             // Leave it alone while someone is typing in it
             if (urlField != null && urlField.hasFocus()) {
-                handler.postDelayed(autoHide, BAR_TIMEOUT_MS);
+                handler.postDelayed(autoHide, barTimeoutMs());
             } else {
-                goImmersive();
+                dismissToolbar();
             }
         }
     };
 
+    private final BroadcastReceiver network = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context c, Intent i) {
+            if (!i.getBooleanExtra("noConnectivity", false) && shepherd != null) shepherd.onNetworkBack();
+        }
+    };
+
+    // ======================================================================
+    // Lifecycle
+    // ======================================================================
+
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        managed = new ManagedState(this);
+        policy = managed.isManaged() ? Policy.parse(managed.policyJson()) : null;
+        if (managed.isManaged() && policy == null) policy = new Policy(new JSONObject()); // locked defaults
 
-        // Keep the screen on while Kiosky is in front (wall-panel use). Set on both the
-        // window and the root view, so it holds even if one of them is replaced.
-        keepScreenOn();
-
-        FrameLayout root = new FrameLayout(this);
-        root.setKeepScreenOn(true);
-
-        web = new WebView(this);
-        WebSettings s = web.getSettings();
-        s.setJavaScriptEnabled(true);
-        s.setDomStorageEnabled(true);   // many dashboards keep sign-in tokens in localStorage
-        s.setDatabaseEnabled(true);
-        s.setMediaPlaybackRequiresUserGesture(false);
-        s.setCacheMode(-1 /* LOAD_DEFAULT */);
-
-        CookieManager cm = CookieManager.getInstance();
-        cm.setAcceptCookie(true);
-        cm.setAcceptThirdPartyCookies(web, true);
-
-        web.setWebChromeClient(new WebChromeClient());
-        web.setWebViewClient(new WebViewClient() {
-            @Override
-            public boolean shouldOverrideUrlLoading(WebView view, String url) {
-                return false; // keep every link, including login redirects, inside the app
-            }
-
-            @Override
-            public void onPageFinished(WebView view, String url) {
-                CookieManager.getInstance().flush();
-            }
-
-            @Override
-            public void onReceivedError(WebView view, int code, String desc, String url) {
-                // Server unreachable (Wi-Fi waking, server restarting): try again shortly
-                handler.removeCallbacks(retry);
-                handler.postDelayed(retry, RETRY_MS);
-            }
-        });
-        root.addView(web, new FrameLayout.LayoutParams(-1, -1)); // MATCH_PARENT
-
-        buildUrlBar(root);
-        buildUpdateBar(root);
+        root = new FrameLayout(this);
+        buildWebView();
+        buildCorner();
+        buildUrlBar();
+        buildUpdateBar();
+        setContentView(root);
 
         updater = new Updater(this, new Updater.Listener() {
             public void onUpdateAvailable(String version, String apkUrl, long size) {
-                if (version.equals(dismissedVersion)) return; // "Later" was tapped for this one
-                updateVersion = version;
-                updateUrl = apkUrl;
-                updateSize = size;
-                updateText.setText("Kiosky " + version + " is available (you have " + updater.version() + ")");
-                updateInstall.setEnabled(true);
-                updateBar.setVisibility(0 /* VISIBLE */);
+                offerUpdate(version, 0, apkUrl, size, null, null);
             }
 
-            public void onInstallFailed() {
-                if (updateVersion == null) return;
-                updateText.setText("Kiosky " + updateVersion + " is available");
-                updateInstall.setEnabled(true);
+            public void onInstallFailed(String reason) {
+                updateFailed(reason);
             }
         });
         handler.postDelayed(autoCheck, FIRST_CHECK_MS);
 
-        // Edge swipe reveals the system bars; show the URL bar alongside them
+        shepherd = new Shepherd(this, shepherdHost, managed);
+        registerReceiver(network, new IntentFilter("android.net.conn.CONNECTIVITY_CHANGE"));
+
+        // Edge swipe reveals the system bars; show the toolbar alongside them
         getWindow().getDecorView().setOnSystemUiVisibilityChangeListener(
                 new View.OnSystemUiVisibilityChangeListener() {
                     public void onSystemUiVisibilityChange(int vis) {
                         if ((vis & 0x4 /* SYSTEM_UI_FLAG_FULLSCREEN */) == 0) {
                             showUrlBar();
-                        } else {
+                        } else if (!unlocked) {
                             hideUrlBar();
                         }
                     }
                 });
 
-        setContentView(root);
+        applyPolicySettings();
 
         if (state != null) {
             web.restoreState(state);
         } else {
-            open(savedUrl());
+            loadHome();
+            handleIntent(getIntent());
+        }
+
+        if (policy != null) {
+            managed.addEvent("app_started", null);
+            // The cached policy was applied above; report it as applied
+            if (policy.version.length() > 0) managed.setApplied(policy.version);
+            shepherd.start();
         }
     }
 
-    private void buildUrlBar(FrameLayout root) {
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleIntent(intent);
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus && (urlBar == null || urlBar.getVisibility() != 0)) goImmersive();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        applyScreenOn(); // re-apply after returning from Settings or the install screen
+        refreshToolbar(); // permissions may have just been granted
+        goImmersive();
+        if (web != null) web.onResume();
+    }
+
+    @Override
+    protected void onPause() {
+        if (web != null) web.onPause();
+        CookieManager.getInstance().flush();
+        super.onPause();
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle out) {
+        super.onSaveInstanceState(out);
+        if (web != null) web.saveState(out);
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (urlBar != null && urlBar.getVisibility() == 0) {
+            dismissToolbar();
+        } else if (web != null && web.canGoBack()) {
+            web.goBack();
+        } else if (policy != null && !policy.allowExit) {
+            // Managed and not allowed to close: stay put
+        } else {
+            super.onBackPressed();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int request, int result, Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request != REQ_SCAN || result != -1 /* RESULT_OK */ || data == null) return;
+        String text = data.getStringExtra("SCAN_RESULT");
+        if (text != null && text.startsWith("kiosky://enroll")) {
+            handleEnrollUri(Uri.parse(text));
+        } else {
+            toast("That QR code isn't a Kiosky enrollment code");
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        handler.removeCallbacks(retry);
+        handler.removeCallbacks(autoHide);
+        handler.removeCallbacks(autoCheck);
+        handler.removeCallbacks(periodicReload);
+        try {
+            unregisterReceiver(network);
+        } catch (Exception ignored) {
+            // not registered
+        }
+        if (shepherd != null) shepherd.stop();
+        if (updater != null) updater.destroy();
+        if (web != null) {
+            web.destroy();
+            web = null;
+        }
+        super.onDestroy();
+    }
+
+    // ======================================================================
+    // Building the screen
+    // ======================================================================
+
+    private void buildWebView() {
+        web = new WebView(this);
+        WebSettings s = web.getSettings();
+        s.setJavaScriptEnabled(true);
+        s.setDomStorageEnabled(true);   // many dashboards keep sign-in tokens in localStorage
+        s.setDatabaseEnabled(true);
+        s.setCacheMode(-1 /* LOAD_DEFAULT */);
+        defaultUserAgent = s.getUserAgentString();
+
+        CookieManager.getInstance().setAcceptCookie(true);
+
+        web.setWebChromeClient(new WebChromeClient());
+        web.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                if (!allowed(url)) {
+                    blocked(url);
+                    return true;
+                }
+                return false; // keep every allowed link, including login redirects, inside the app
+            }
+
+            @Override
+            public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                errorThisLoad = false;
+                if (!allowed(url)) { // catches redirects that skip shouldOverrideUrlLoading
+                    view.stopLoading();
+                    blocked(url);
+                    if (view.canGoBack()) view.goBack(); else loadHome();
+                }
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                CookieManager.getInstance().flush();
+                if (errorThisLoad) return;
+                pageError = null;
+                lastErrorKey = null;
+                if (url != null && !url.equals(lastLoadedUrl) && !isInternal(url)) {
+                    lastLoadedUrl = url;
+                    managed.addEvent("page_loaded", Json.obj("url", url, "title", view.getTitle()));
+                }
+            }
+
+            @Override
+            public void onReceivedError(WebView view, int code, String desc, String url) {
+                errorThisLoad = true;
+                pageError = desc + " (" + code + ")";
+                String key = code + " " + url;
+                if (!key.equals(lastErrorKey)) { // once per failure, not on every retry
+                    lastErrorKey = key;
+                    lastLoadedUrl = null;
+                    managed.addEvent("page_error", Json.obj("code", code, "description", desc, "url", url));
+                }
+                // Server unreachable (Wi-Fi waking, server restarting): try again shortly
+                handler.removeCallbacks(retry);
+                handler.postDelayed(retry, policy != null ? policy.retrySeconds * 1000L : RETRY_MS);
+            }
+        });
+        root.addView(web, new FrameLayout.LayoutParams(-1, -1)); // MATCH_PARENT
+    }
+
+    /** Five quick taps in the top-left corner open the technician PIN pad (§5.3). */
+    private void buildCorner() {
+        int size = (int) (48 * getResources().getDisplayMetrics().density);
+        corner = new View(this);
+        corner.setVisibility(8 /* GONE */);
+        corner.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                long now = System.currentTimeMillis();
+                System.arraycopy(cornerTaps, 1, cornerTaps, 0, cornerTaps.length - 1);
+                cornerTaps[cornerTaps.length - 1] = now;
+                if (now - cornerTaps[0] <= 3000L) {
+                    for (int i = 0; i < cornerTaps.length; i++) cornerTaps[i] = 0;
+                    showPinPad();
+                }
+            }
+        });
+        root.addView(corner, new FrameLayout.LayoutParams(size, size, 48 | 3 /* TOP | LEFT */));
+    }
+
+    private void buildUrlBar() {
         float d = getResources().getDisplayMetrics().density;
         int pad = (int) (8 * d);
 
@@ -179,6 +378,11 @@ public class MainActivity extends Activity {
         urlBar.setBackgroundColor(0xEE1C1C1E);
         urlBar.setPadding(pad, statusBar + pad, pad, pad);
         urlBar.setVisibility(8 /* GONE */);
+
+        mgmtStatus = new TextView(this);
+        mgmtStatus.setTextColor(0xFFFFB4A9);
+        mgmtStatus.setPadding(0, 0, pad, 0);
+        urlBar.addView(mgmtStatus, new LinearLayout.LayoutParams(-2, -2));
 
         urlField = new EditText(this);
         urlField.setSingleLine(true);
@@ -200,67 +404,78 @@ public class MainActivity extends Activity {
         });
         urlBar.addView(urlField, new LinearLayout.LayoutParams(0, -2, 1f));
 
-        Button go = new Button(this);
-        go.setText("Go");
-        go.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
+        goButton = button("Go", new Runnable() {
+            public void run() {
                 applyUrl(urlField.getText().toString());
             }
         });
-        urlBar.addView(go, new LinearLayout.LayoutParams(-2, -2));
-
-        Button reload = new Button(this);
-        reload.setText("Reload");
-        reload.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
+        button("Reload", new Runnable() {
+            public void run() {
                 web.reload();
-                goImmersive();
+                dismissToolbar();
             }
         });
-        urlBar.addView(reload, new LinearLayout.LayoutParams(-2, -2));
-
-        Button help = new Button(this);
-        help.setText("Help");
-        help.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
+        button("Help", new Runnable() {
+            public void run() {
                 showHelp(); // view only; the saved address stays as it is
-                goImmersive();
+                dismissToolbar();
             }
         });
-        urlBar.addView(help, new LinearLayout.LayoutParams(-2, -2));
-
-        Button update = new Button(this);
-        update.setText("Update");
-        update.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
+        updateButton = button("Update", new Runnable() {
+            public void run() {
                 dismissedVersion = null; // a manual check always shows what it finds
                 updater.check(true);
             }
         });
-        urlBar.addView(update, new LinearLayout.LayoutParams(-2, -2));
-
-        bootToggle = new Button(this);
-        bootToggle.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
-                setStartOnBoot(!startOnBoot());
+        bootToggle = button("", new Runnable() {
+            public void run() {
+                setStartOnBoot(!startOnBoot(MainActivity.this));
             }
         });
-        urlBar.addView(bootToggle, new LinearLayout.LayoutParams(-2, -2));
-        refreshBootToggle();
-
-        Button close = new Button(this);
-        close.setText("✕");
-        close.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
-                goImmersive();
+        enrollButton = button("Enroll", new Runnable() {
+            public void run() {
+                showEnrollForm(null, null);
             }
         });
-        urlBar.addView(close, new LinearLayout.LayoutParams(-2, -2));
+        infoButton = button("Device info", new Runnable() {
+            public void run() {
+                showDeviceInfo();
+            }
+        });
+        overlayButton = button("Allow start on boot", new Runnable() {
+            public void run() {
+                openOverlaySettings();
+            }
+        });
+        installButton = button("Allow updates", new Runnable() {
+            public void run() {
+                openSettings("android.settings.MANAGE_UNKNOWN_APP_SOURCES");
+            }
+        });
+        button("✕", new Runnable() {
+            public void run() {
+                dismissToolbar();
+            }
+        });
 
         root.addView(urlBar, new FrameLayout.LayoutParams(-1, -2, 48 /* Gravity.TOP */));
     }
 
-    private void buildUpdateBar(FrameLayout root) {
+    private Button button(String label, final Runnable action) {
+        Button b = new Button(this);
+        b.setText(label);
+        b.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                handler.removeCallbacks(autoHide);
+                handler.postDelayed(autoHide, barTimeoutMs());
+                action.run();
+            }
+        });
+        urlBar.addView(b, new LinearLayout.LayoutParams(-2, -2));
+        return b;
+    }
+
+    private void buildUpdateBar() {
         float d = getResources().getDisplayMetrics().density;
         int pad = (int) (8 * d);
 
@@ -279,9 +494,7 @@ public class MainActivity extends Activity {
         updateInstall.setText("Install");
         updateInstall.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
-                updateInstall.setEnabled(false);
-                updateText.setText("Downloading Kiosky " + updateVersion + "…");
-                updater.install(updateUrl, updateSize);
+                startInstall();
             }
         });
         updateBar.addView(updateInstall, new LinearLayout.LayoutParams(-2, -2));
@@ -299,153 +512,140 @@ public class MainActivity extends Activity {
         root.addView(updateBar, new FrameLayout.LayoutParams(-1, -2, 80 /* Gravity.BOTTOM */));
     }
 
-    static boolean startOnBoot(android.content.Context c) {
-        return c.getSharedPreferences(PREFS, 0).getBoolean(KEY_BOOT, false);
-    }
-
-    private boolean startOnBoot() {
-        return startOnBoot(this);
-    }
-
-    /** Android 10+ only lets an app open itself at boot if it may display over other apps. */
-    private boolean canStartFromBackground() {
-        return Build.VERSION.SDK_INT < 29 || Settings.canDrawOverlays(this);
-    }
-
-    private void setStartOnBoot(boolean on) {
-        SharedPreferences.Editor ed = getSharedPreferences(PREFS, 0).edit();
-        ed.putBoolean(KEY_BOOT, on);
-        ed.apply();
-        refreshBootToggle();
-
-        if (on && !canStartFromBackground()) {
-            Toast.makeText(this, "Turn on \"Display over other apps\" for Kiosky so it can open "
-                    + "when the tablet starts, then go back", 1 /* LENGTH_LONG */).show();
-            try {
-                startActivity(new Intent("android.settings.action.MANAGE_OVERLAY_PERMISSION",
-                        Uri.parse("package:" + getPackageName())));
-            } catch (Exception e) {
-                Toast.makeText(this, "Open Settings › Apps › Kiosky and allow "
-                        + "\"Display over other apps\"", 1).show();
-            }
-        } else {
-            Toast.makeText(this, on ? "Kiosky will open when the tablet starts"
-                    : "Kiosky won't open on its own at start-up", 0 /* LENGTH_SHORT */).show();
-        }
-    }
-
-    private void refreshBootToggle() {
-        if (bootToggle == null) return;
-        if (!startOnBoot()) {
-            bootToggle.setText("Start on boot: Off");
-        } else if (!canStartFromBackground()) {
-            bootToggle.setText("Start on boot: Needs permission");
-        } else {
-            bootToggle.setText("Start on boot: On");
-        }
-    }
+    // ======================================================================
+    // Pages and navigation
+    // ======================================================================
 
     private String savedUrl() {
         return getSharedPreferences(PREFS, 0).getString(KEY_URL, DEFAULT_URL);
     }
 
-    private void applyUrl(String raw) {
-        String url = raw == null ? "" : raw.trim();
-        if (url.length() == 0) url = DEFAULT_URL;
-        if (url.indexOf("://") < 0) url = "https://" + url;
+    /** The start page: the policy's when managed, the saved address otherwise. */
+    private String homeUrl() {
+        if (policy == null) return savedUrl();
+        return policy.url.length() == 0 ? Pages.WAITING_URL : policy.url;
+    }
 
-        SharedPreferences.Editor ed = getSharedPreferences(PREFS, 0).edit();
-        ed.putString(KEY_URL, url);
-        ed.apply();
-
-        open(url);
-        goImmersive();
+    private void loadHome() {
+        tempHost = null;
+        onTemporaryPage = false;
+        open(homeUrl());
     }
 
     private void open(String url) {
-        if (HELP_URL.equals(url)) {
+        if (Pages.HELP_URL.equals(url)) {
             showHelp();
+        } else if (Pages.WAITING_URL.equals(url)) {
+            String org = policy != null ? policy.organisation : "your organisation";
+            web.loadDataWithBaseURL(Pages.WAITING_URL, Pages.waiting(org, managed.name()),
+                    "text/html", "utf-8", Pages.WAITING_URL);
         } else {
             web.loadUrl(url);
         }
     }
 
     private void showHelp() {
-        // WebView can't display Markdown, so convert it to HTML first
-        web.loadDataWithBaseURL(HELP_URL, helpHtml(), "text/html", "utf-8", HELP_URL);
+        // WebView can't display Markdown, so it's converted to HTML first
+        web.loadDataWithBaseURL(Pages.HELP_URL, Pages.help(this), "text/html", "utf-8", Pages.HELP_URL);
     }
 
-    private String helpHtml() {
-        String body;
-        try {
-            body = Markdown.toHtml(readAsset("help.md").replace("{{version}}", Updater.currentVersion(this)));
-        } catch (IOException e) {
-            body = "<h1>Kiosky</h1><p>The help page couldn't be loaded. Swipe in from the top "
-                    + "or bottom edge to open the toolbar and enter an address.</p>";
+    private static boolean isInternal(String url) {
+        return url == null || url.startsWith("file:///android_asset/") || url.startsWith("about:")
+                || url.startsWith("data:");
+    }
+
+    /** allowed_hosts enforcement (§5.2). Unmanaged tablets can go anywhere. */
+    private boolean allowed(String url) {
+        if (policy == null || isInternal(url) || url.equals(policy.url)) return true;
+        if (tempHost != null && tempHost.equals(Policy.host(url))) return true;
+        return policy.allows(url);
+    }
+
+    private void blocked(String url) {
+        managed.addEvent("navigation_blocked", Json.obj("url", url));
+        toast("This site isn't allowed on this tablet");
+    }
+
+    /** The address box. Unmanaged: saved. Managed (full toolbar or unlocked): temporary. */
+    private void applyUrl(String raw) {
+        String url = raw == null ? "" : raw.trim();
+        if (policy != null) {
+            if (url.length() == 0) {
+                loadHome();
+            } else {
+                if (url.indexOf("://") < 0) url = "https://" + url;
+                if (unlocked) tempHost = Policy.host(url); // a technician may go anywhere
+                onTemporaryPage = true;
+                web.loadUrl(url); // never saved; restart, go_home or a policy change returns home
+            }
+            dismissToolbar();
+            return;
         }
-        return "<!doctype html><html><head><meta charset=\"utf-8\">"
-                + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-                + "<title>Kiosky help</title><style>" + HELP_CSS + "</style></head>"
-                + "<body>" + HELP_ARROW + "<main>" + body + "</main></body></html>";
+
+        if (url.length() == 0) url = DEFAULT_URL;
+        if (url.indexOf("://") < 0) url = "https://" + url;
+        SharedPreferences.Editor ed = getSharedPreferences(PREFS, 0).edit();
+        ed.putString(KEY_URL, url);
+        ed.apply();
+        open(url);
+        dismissToolbar();
     }
 
-    private String readAsset(String name) throws IOException {
-        BufferedReader r = new BufferedReader(new InputStreamReader(getAssets().open(name), "UTF-8"));
-        try {
-            StringBuilder b = new StringBuilder();
-            char[] buf = new char[4096];
-            int n;
-            while ((n = r.read(buf)) > 0) b.append(buf, 0, n);
-            return b.toString();
-        } finally {
-            r.close();
+    // ======================================================================
+    // Toolbar
+    // ======================================================================
+
+    private long barTimeoutMs() {
+        return policy != null ? policy.toolbarTimeoutSeconds * 1000L : BAR_TIMEOUT_MS;
+    }
+
+    private boolean toolbarAllowed() {
+        return policy == null || unlocked || !"hidden".equals(policy.toolbarMode);
+    }
+
+    /** Shows exactly the controls this state allows (§5.2 toolbar.mode). */
+    private void refreshToolbar() {
+        boolean isManaged = policy != null;
+        boolean addressBox = !isManaged || unlocked || "full".equals(policy.toolbarMode);
+        show(urlField, addressBox);
+        show(goButton, addressBox);
+        show(updateButton, !isManaged);
+        show(bootToggle, !isManaged);
+        show(enrollButton, !isManaged);
+        show(infoButton, isManaged && unlocked);
+        show(overlayButton, isManaged && unlocked && policy.startOnBoot && !DeviceInfo.overlayPermission(this));
+        show(installButton, isManaged && unlocked && !DeviceInfo.installPermission(this));
+        String err = shepherd != null ? shepherd.lastError : null;
+        mgmtStatus.setText(err != null ? err : "");
+        show(mgmtStatus, isManaged && unlocked && err != null);
+
+        if (!isManaged) {
+            if (!startOnBoot(this)) {
+                bootToggle.setText("Start on boot: Off");
+            } else if (!DeviceInfo.overlayPermission(this)) {
+                bootToggle.setText("Start on boot: Needs permission");
+            } else {
+                bootToggle.setText("Start on boot: On");
+            }
         }
     }
 
-    // Points at the top edge, where a swipe opens the toolbar
-    private static final String HELP_ARROW =
-            "<div class=\"edge\" aria-hidden=\"true\"><svg viewBox=\"0 0 24 24\" width=\"44\" height=\"44\">"
-            + "<path d=\"M12 21V4M5 11l7-7 7 7\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.5\" "
-            + "stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>"
-            + "<span>Swipe down from this edge to open the menu</span></div>";
-
-    private static final String HELP_CSS =
-            ":root{color-scheme:light dark;--bg:#f5f5f7;--fg:#1c1c1e;--muted:#6e6e73;--line:#d2d2d7;"
-            + "--card:#fff;--accent:#0a66d8}"
-            + "@media (prefers-color-scheme:dark){:root{--bg:#1c1c1e;--fg:#f2f2f7;--muted:#a1a1a6;"
-            + "--line:#3a3a3c;--card:#2c2c2e;--accent:#4ea1ff}}"
-            + "body{margin:0;background:var(--bg);color:var(--fg);"
-            + "font:18px/1.6 system-ui,-apple-system,Roboto,sans-serif}"
-            + "main{max-width:44rem;margin:0 auto;padding:8rem 1.5rem 4rem}"
-            + ".edge{position:fixed;top:0;left:0;right:0;z-index:1;pointer-events:none;display:flex;"
-            + "flex-direction:column;align-items:center;gap:.2rem;padding:.6rem 1rem 1.6rem;text-align:center;"
-            + "color:var(--accent);font-weight:600;font-size:1rem;background:linear-gradient(var(--bg) 65%,transparent)}"
-            + ".edge::before{content:\"\";position:absolute;top:0;left:0;right:0;height:4px;background:var(--accent)}"
-            + ".edge svg{animation:nudge 1.6s ease-in-out infinite}"
-            + "@keyframes nudge{0%,100%{transform:translateY(0)}50%{transform:translateY(-8px)}}"
-            + "@media (prefers-reduced-motion:reduce){.edge svg{animation:none}}"
-            + "img{max-width:100%}main>p:first-child img{display:block;width:8rem;height:8rem;margin:0 0 1.25rem;"
-            + "filter:drop-shadow(0 4px 10px rgba(0,0,0,.15))}"
-            + "h1{font-size:2.2rem;line-height:1.2;margin:0 0 1rem}"
-            + "h2{font-size:1.35rem;margin:2.5rem 0 .75rem;padding-top:1.5rem;border-top:1px solid var(--line)}"
-            + "a{color:var(--accent)}li{margin:.4rem 0}"
-            + "code{font:.9em ui-monospace,monospace;background:var(--card);border:1px solid var(--line);"
-            + "border-radius:4px;padding:.1em .35em}"
-            + "pre{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:1rem;overflow-x:auto}"
-            + "pre code{border:0;padding:0}"
-            + "blockquote{margin:1.25rem 0;padding:.75rem 1rem;background:var(--card);"
-            + "border-left:4px solid var(--accent);border-radius:4px}blockquote p{margin:0}"
-            + ".table{overflow-x:auto}table{border-collapse:collapse;width:100%;background:var(--card);"
-            + "border-radius:8px;overflow:hidden}"
-            + "th,td{text-align:left;padding:.6rem .9rem;border-bottom:1px solid var(--line);vertical-align:top}"
-            + "th{color:var(--muted);font-size:.85em;text-transform:uppercase;letter-spacing:.04em}"
-            + "tr:last-child td{border-bottom:0}hr{border:0;border-top:1px solid var(--line);margin:2rem 0}";
+    private static void show(View v, boolean visible) {
+        if (v != null) v.setVisibility(visible ? 0 : 8);
+    }
 
     private void showUrlBar() {
-        urlField.setText(savedUrl());
+        if (!toolbarAllowed()) return; // managed "hidden": the system bars show, the toolbar doesn't
+        refreshToolbar();
+        if (policy == null) {
+            urlField.setText(savedUrl());
+        } else {
+            String current = web.getUrl();
+            urlField.setText(current == null || isInternal(current) ? policy.url : current);
+        }
         urlBar.setVisibility(0 /* VISIBLE */);
         handler.removeCallbacks(autoHide);
-        handler.postDelayed(autoHide, BAR_TIMEOUT_MS);
+        handler.postDelayed(autoHide, barTimeoutMs());
     }
 
     private void hideUrlBar() {
@@ -455,11 +655,13 @@ public class MainActivity extends Activity {
         if (imm != null) imm.hideSoftInputFromWindow(urlField.getWindowToken(), 0);
         urlField.clearFocus();
         urlBar.setVisibility(8 /* GONE */);
+        unlocked = false; // the technician unlock lasts until the toolbar hides
         web.requestFocus();
     }
 
-    private void keepScreenOn() {
-        getWindow().addFlags(128 /* FLAG_KEEP_SCREEN_ON */);
+    private void dismissToolbar() {
+        hideUrlBar();
+        goImmersive();
     }
 
     private void goImmersive() {
@@ -469,55 +671,475 @@ public class MainActivity extends Activity {
                 0x100 | 0x200 | 0x400 | 0x2 | 0x4 | 0x800);
     }
 
-    @Override
-    public void onWindowFocusChanged(boolean hasFocus) {
-        super.onWindowFocusChanged(hasFocus);
-        if (hasFocus && (urlBar == null || urlBar.getVisibility() != 0)) goImmersive();
+    // ======================================================================
+    // Policy (§5)
+    // ======================================================================
+
+    /** Applies every setting that doesn't involve navigating. */
+    private void applyPolicySettings() {
+        Policy p = policy;
+        WebSettings s = web.getSettings();
+        s.setTextZoom(p != null ? p.textZoom : 100);
+        s.setUserAgentString(p != null && p.userAgentSuffix.length() > 0
+                ? defaultUserAgent + " " + p.userAgentSuffix : defaultUserAgent);
+        s.setMediaPlaybackRequiresUserGesture(p != null && !p.autoplayMedia);
+        CookieManager.getInstance().setAcceptThirdPartyCookies(web, p == null || p.thirdPartyCookies);
+        applyScreenOn();
+        setRequestedOrientation(p != null ? p.orientationCode() : -1);
+
+        corner.setVisibility(p != null && p.pin != null ? 0 : 8);
+        if (!toolbarAllowed()) hideUrlBar();
+        refreshToolbar();
+
+        handler.removeCallbacks(periodicReload);
+        if (p != null && p.reloadMinutes > 0) handler.postDelayed(periodicReload, p.reloadMinutes * 60000L);
     }
 
-    @Override
-    protected void onResume() {
-        super.onResume();
-        keepScreenOn(); // re-apply after returning from Settings or the install screen
-        refreshBootToggle(); // the permission may have just been granted
-        goImmersive();
-        if (web != null) web.onResume();
+    private void applyScreenOn() {
+        boolean on = policy == null || policy.keepScreenOn;
+        // Window flag plus view flag, so it holds even if one of them is replaced
+        if (on) getWindow().addFlags(128 /* FLAG_KEEP_SCREEN_ON */);
+        else getWindow().clearFlags(128);
+        if (root != null) root.setKeepScreenOn(on);
     }
 
-    @Override
-    protected void onPause() {
-        if (web != null) web.onPause();
-        CookieManager.getInstance().flush();
-        super.onPause();
-    }
+    private final Shepherd.Host shepherdHost = new Shepherd.Host() {
+        public JSONObject status() {
+            return DeviceInfo.status(MainActivity.this, web.getUrl(), web.getTitle(), pageError,
+                    web.getSettings().getUserAgentString());
+        }
 
-    @Override
-    protected void onSaveInstanceState(Bundle out) {
-        super.onSaveInstanceState(out);
-        if (web != null) web.saveState(out);
-    }
+        public void onPolicy(Policy p) {
+            String oldUrl = policy != null ? policy.url : null;
+            policy = p;
+            applyPolicySettings();
+            if (oldUrl == null || !oldUrl.equals(p.url) || onTemporaryPage) loadHome();
+            managed.setApplied(p.version);
+            managed.addEvent("policy_applied", Json.obj("version", p.version));
+        }
 
-    @Override
-    public void onBackPressed() {
-        if (urlBar != null && urlBar.getVisibility() == 0) {
-            goImmersive();
-        } else if (web != null && web.canGoBack()) {
-            web.goBack();
+        public void onUpdateOffer(JSONObject u) {
+            int code = u.optInt("version_code", 0);
+            if (code <= Updater.currentVersionCode(MainActivity.this)) return; // never downgrade
+            offerUpdate(Json.str(u, "version", String.valueOf(code)), code, Json.str(u, "url", null),
+                    u.optLong("size", -1), "Bearer " + managed.token(), Json.str(u, "sha256", null));
+        }
+
+        public JSONObject runCommand(String type, JSONObject params) {
+            return command(type, params);
+        }
+
+        public void restartApp() {
+            recreate();
+        }
+
+        public void onRetired(Policy last) {
+            String org = last != null ? last.organisation : "your organisation";
+            // Keep the screen as it is: the managed start page becomes the local one
+            SharedPreferences.Editor ed = getSharedPreferences(PREFS, 0).edit();
+            if (last != null && last.url.length() > 0) ed.putString(KEY_URL, last.url);
+            if (last != null) ed.putBoolean(KEY_BOOT, last.startOnBoot);
+            ed.apply();
+            boolean waiting = Pages.WAITING_URL.equals(web.getUrl()) || (last != null && last.url.length() == 0);
+            policy = null;
+            unlocked = false;
+            tempHost = null;
+            applyPolicySettings();
+            if (waiting) loadHome();
+            showOverlay("This tablet is no longer managed by " + org, 8, false);
+        }
+
+        public void onEnrolled(Policy p, String name) {
+            policy = p;
+            applyPolicySettings();
+            loadHome();
+            dismissToolbar();
+            managed.setApplied(p.version);
+            managed.addEvent("policy_applied", Json.obj("version", p.version));
+            toast("This tablet is now managed by " + p.organisation + (name.length() > 0 ? " as " + name : ""));
+        }
+
+        public void onEnrollFailed(String message) {
+            toast(message);
+        }
+    };
+
+    // ======================================================================
+    // Commands (§7)
+    // ======================================================================
+
+    private JSONObject command(String type, JSONObject params) {
+        if ("reload".equals(type)) {
+            web.reload();
+        } else if ("go_home".equals(type)) {
+            loadHome();
+        } else if ("navigate".equals(type)) {
+            String url = Json.str(params, "url", "");
+            if (!url.startsWith("https://")) return failed("url must start with https://");
+            tempHost = Policy.host(url); // admin-sent addresses skip allowed_hosts
+            onTemporaryPage = true;
+            web.loadUrl(url);
+        } else if ("clear_cache".equals(type)) {
+            web.clearCache(true);
+            web.reload();
+        } else if ("clear_web_data".equals(type)) {
+            CookieManager.getInstance().removeAllCookies(null);
+            CookieManager.getInstance().flush();
+            WebStorage.getInstance().deleteAllData();
+            web.clearCache(true);
+            web.clearHistory();
+            loadHome();
+        } else if ("check_update".equals(type)) {
+            if ("off".equals(policy.updateSource)) return failed("updates are turned off in the policy");
+            if ("github".equals(policy.updateSource)) updater.check(false); // server: the next check-in brings it
+        } else if ("show_message".equals(type)) {
+            String text = Json.str(params, "text", "");
+            if (text.length() == 0) return failed("no text");
+            showOverlay(text, Json.clamp(params.optInt("seconds", 30), 1, 86400), false);
+        } else if ("identify".equals(type)) {
+            showOverlay(managed.name() + "\n" + managed.deviceId(),
+                    Json.clamp(params.optInt("seconds", 30), 1, 3600), true);
+        } else if ("screenshot".equals(type)) {
+            return screenshot(Json.clamp(params.optInt("max_width", 1280), 64, 4096),
+                    Json.clamp(params.optInt("quality", 70), 10, 100));
         } else {
-            super.onBackPressed();
+            return failed("unsupported command");
+        }
+        return Json.obj("status", "done");
+    }
+
+    private static JSONObject failed(String message) {
+        return Json.obj("status", "failed", "message", message);
+    }
+
+    private JSONObject screenshot(int maxWidth, int quality) {
+        int w = web.getWidth(), h = web.getHeight();
+        if (w <= 0 || h <= 0) return failed("the page isn't on screen");
+        Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        web.draw(new Canvas(bmp));
+        if (w > maxWidth) {
+            Bitmap scaled = Bitmap.createScaledBitmap(bmp, maxWidth, Math.max(1, h * maxWidth / w), true);
+            bmp.recycle();
+            bmp = scaled;
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        bmp.compress(Bitmap.CompressFormat.JPEG, quality, out);
+        JSONObject r = Json.obj("status", "done",
+                "data", Json.obj("width", bmp.getWidth(), "height", bmp.getHeight()),
+                "screenshot", Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP));
+        bmp.recycle();
+        return r;
+    }
+
+    /** Large centred text over the page, with a dismiss button (show_message, identify). */
+    private void showOverlay(String text, int seconds, boolean huge) {
+        if (overlay != null) root.removeView(overlay);
+        float d = getResources().getDisplayMetrics().density;
+        int pad = (int) (24 * d);
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(1 /* VERTICAL */);
+        box.setGravity(17 /* CENTER */);
+        box.setBackgroundColor(huge ? 0xFF0A66D8 : 0xEE1C1C1E);
+        box.setPadding(pad, pad, pad, pad);
+        box.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                // swallow taps so they don't reach the page underneath
+            }
+        });
+
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextColor(0xFFFFFFFF);
+        t.setTextSize(huge ? 56 : 32);
+        t.setGravity(17 /* CENTER */);
+        box.addView(t, new LinearLayout.LayoutParams(-1, -2));
+
+        Button dismiss = new Button(this);
+        dismiss.setText("Dismiss");
+        final View shown = box;
+        final Runnable remove = new Runnable() {
+            public void run() {
+                if (overlay == shown) {
+                    root.removeView(shown);
+                    overlay = null;
+                }
+            }
+        };
+        dismiss.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                remove.run();
+            }
+        });
+        box.addView(dismiss, new LinearLayout.LayoutParams(-2, -2));
+
+        overlay = box;
+        root.addView(box, new FrameLayout.LayoutParams(-1, -1));
+        handler.postDelayed(remove, seconds * 1000L);
+    }
+
+    // ======================================================================
+    // Updates (§6)
+    // ======================================================================
+
+    /** {@code code} is 0 for GitHub releases, whose version code isn't known up front. */
+    private void offerUpdate(String version, int code, String url, long size, String auth, String sha) {
+        if (url == null || updater.isBusy()) return;
+        if (policy != null && "off".equals(policy.updateSource)) return;
+        if (code != 0 && code == failedCode && System.currentTimeMillis() - failedAt < HOUR_MS) return;
+        updateVersion = version;
+        updateCode = code;
+        updateUrl = url;
+        updateSize = size;
+        updateAuth = auth;
+        updateSha = sha;
+        if (policy != null && policy.autoInstall) {
+            startInstall();
+        } else if (!version.equals(dismissedVersion)) { // "Later" was tapped for this one
+            updateText.setText("Kiosky " + version + " is available (you have " + updater.version() + ")");
+            updateInstall.setEnabled(true);
+            updateBar.setVisibility(0 /* VISIBLE */);
         }
     }
 
-    @Override
-    protected void onDestroy() {
-        handler.removeCallbacks(retry);
-        handler.removeCallbacks(autoHide);
-        handler.removeCallbacks(autoCheck);
-        if (updater != null) updater.destroy();
-        if (web != null) {
-            web.destroy();
-            web = null;
+    private void startInstall() {
+        if (updateUrl == null || updater.isBusy()) return;
+        updateInstall.setEnabled(false);
+        updateText.setText("Downloading Kiosky " + updateVersion + "…");
+        managed.addEvent("update_started", Json.obj("version", updateVersion, "version_code", updateCode));
+        updater.install(updateUrl, updateSize, updateAuth, updateSha);
+    }
+
+    private void updateFailed(String reason) {
+        managed.addEvent("update_failed", Json.obj("version", updateVersion, "version_code", updateCode,
+                "reason", reason));
+        failedCode = updateCode;
+        failedAt = System.currentTimeMillis();
+        if (updateVersion == null) return;
+        updateText.setText("Kiosky " + updateVersion + " is available");
+        updateInstall.setEnabled(true);
+    }
+
+    // ======================================================================
+    // Start on boot
+    // ======================================================================
+
+    /** Managed: the policy decides. Unmanaged: the local toggle. */
+    static boolean startOnBoot(Context c) {
+        if (ManagedState.isManaged(c)) {
+            Policy p = ManagedState.cachedPolicy(c);
+            return p == null || p.startOnBoot;
         }
-        super.onDestroy();
+        return c.getSharedPreferences(PREFS, 0).getBoolean(KEY_BOOT, false);
+    }
+
+    private void setStartOnBoot(boolean on) {
+        SharedPreferences.Editor ed = getSharedPreferences(PREFS, 0).edit();
+        ed.putBoolean(KEY_BOOT, on);
+        ed.apply();
+        refreshToolbar();
+
+        if (on && !DeviceInfo.overlayPermission(this)) {
+            toast("Turn on \"Display over other apps\" for Kiosky so it can open when the tablet starts, then go back");
+            openOverlaySettings();
+        } else {
+            toast(on ? "Kiosky will open when the tablet starts" : "Kiosky won't open on its own at start-up");
+        }
+    }
+
+    private void openOverlaySettings() {
+        openSettings("android.settings.action.MANAGE_OVERLAY_PERMISSION");
+    }
+
+    private void openSettings(String action) {
+        try {
+            startActivity(new Intent(action, Uri.parse("package:" + getPackageName())));
+        } catch (Exception e) {
+            toast("Open Settings › Apps › Kiosky to change this");
+        }
+    }
+
+    // ======================================================================
+    // Technician PIN (§5.3)
+    // ======================================================================
+
+    private void showPinPad() {
+        if (policy == null || policy.pin == null) return;
+        long wait = pinLockedUntil - System.currentTimeMillis();
+        if (wait > 0) {
+            toast("Too many wrong PINs. Try again in " + ((wait + 59999) / 60000) + " min");
+            return;
+        }
+        final EditText field = new EditText(this);
+        field.setInputType(0x12 /* TYPE_CLASS_NUMBER | TYPE_NUMBER_VARIATION_PASSWORD */);
+        field.setHint("PIN");
+        new AlertDialog.Builder(this)
+                .setTitle("Technician PIN")
+                .setView(field)
+                .setPositiveButton("Unlock", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dlg, int which) {
+                        checkPin(field.getText().toString());
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void checkPin(final String entered) {
+        final JSONObject spec = policy.pin;
+        new Thread(new Runnable() {
+            public void run() {
+                final boolean ok = Pin.verify(entered, spec); // slow by design
+                handler.post(new Runnable() {
+                    public void run() {
+                        if (ok) {
+                            pinFails = 0;
+                            unlocked = true;
+                            showUrlBar();
+                            if (shepherd.lastError != null) toast(shepherd.lastError);
+                        } else if (++pinFails >= MAX_PIN_TRIES) {
+                            pinFails = 0;
+                            pinLockedUntil = System.currentTimeMillis() + PIN_LOCKOUT_MS;
+                            managed.addEvent("pin_failed", Json.obj("attempts", MAX_PIN_TRIES));
+                            toast("Too many wrong PINs. PIN entry is locked for 5 minutes");
+                        } else {
+                            toast("Wrong PIN");
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private void showDeviceInfo() {
+        StringBuilder b = new StringBuilder();
+        b.append("Managed by: ").append(policy.organisation)
+         .append("\nServer: ").append(managed.server())
+         .append("\nDevice: ").append(managed.name()).append(" (").append(managed.deviceId()).append(')')
+         .append("\nKiosky: ").append(Updater.currentVersion(this))
+         .append("\nPolicy version: ").append(managed.appliedVersion());
+        long last = shepherd.lastCheckinAt;
+        b.append("\nLast check-in: ").append(last == 0 ? "not yet since start"
+                : ((System.currentTimeMillis() - last) / 1000) + " s ago");
+        b.append("\nStatus: ").append(shepherd.lastError != null ? shepherd.lastError : "OK");
+        b.append("\nStart on boot permission: ").append(DeviceInfo.overlayPermission(this) ? "granted" : "missing");
+        b.append("\nInstall permission: ").append(DeviceInfo.installPermission(this) ? "granted" : "missing");
+        new AlertDialog.Builder(this)
+                .setTitle("Device info")
+                .setMessage(b.toString())
+                .setPositiveButton("OK", null)
+                .setNeutralButton("Check in now", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dlg, int which) {
+                        shepherd.checkinNow();
+                    }
+                })
+                .show();
+    }
+
+    // ======================================================================
+    // Enrollment (§3)
+    // ======================================================================
+
+    private void handleIntent(Intent i) {
+        if (i == null || !"android.intent.action.VIEW".equals(i.getAction()) || i.getData() == null) return;
+        Uri u = i.getData();
+        if ("kiosky".equals(u.getScheme()) && "enroll".equals(u.getHost())) handleEnrollUri(u);
+    }
+
+    private void handleEnrollUri(Uri u) {
+        if (policy != null) {
+            // Never re-enroll a managed tablet: that would be a way out of lockdown
+            toast("This tablet is already managed by " + policy.organisation);
+            return;
+        }
+        confirmEnroll(u.getQueryParameter("server"), u.getQueryParameter("token"));
+    }
+
+    private void showEnrollForm(String server, String code) {
+        float d = getResources().getDisplayMetrics().density;
+        int pad = (int) (20 * d);
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(1 /* VERTICAL */);
+        form.setPadding(pad, pad / 2, pad, 0);
+
+        final EditText serverField = new EditText(this);
+        serverField.setSingleLine(true);
+        serverField.setInputType(0x11 /* URI */);
+        serverField.setHint("Server, e.g. kiosks.example.com");
+        if (server != null) serverField.setText(server);
+        form.addView(serverField, new LinearLayout.LayoutParams(-1, -2));
+
+        final EditText codeField = new EditText(this);
+        codeField.setSingleLine(true);
+        codeField.setInputType(0x1001 /* TEXT | CAP_CHARACTERS */);
+        codeField.setHint("Code, e.g. ABCD-2EFG-H3JK");
+        if (code != null) codeField.setText(code);
+        form.addView(codeField, new LinearLayout.LayoutParams(-1, -2));
+
+        new AlertDialog.Builder(this)
+                .setTitle("Enroll with a Shepherd server")
+                .setMessage("Enter the server and code from your administrator, or scan its QR code.")
+                .setView(form)
+                .setPositiveButton("Enroll", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dlg, int which) {
+                        confirmEnroll(serverField.getText().toString(), codeField.getText().toString());
+                    }
+                })
+                .setNeutralButton("Scan QR", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dlg, int which) {
+                        scanQr();
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void scanQr() {
+        try {
+            Intent scan = new Intent("com.google.zxing.client.android.SCAN");
+            scan.putExtra("SCAN_MODE", "QR_CODE_MODE");
+            startActivityForResult(scan, REQ_SCAN);
+        } catch (Exception e) {
+            toast("No QR scanner app found. Scan the code with the camera app, or type the server and code");
+        }
+    }
+
+    private void confirmEnroll(String rawServer, final String rawCode) {
+        String s = rawServer == null ? "" : rawServer.trim();
+        while (s.endsWith("/")) s = s.substring(0, s.length() - 1);
+        final String code = rawCode == null ? "" : rawCode.trim();
+        if (s.length() == 0 || code.length() == 0) {
+            toast("Enter both the server and the code");
+            showEnrollForm(s, code);
+            return;
+        }
+        if (s.regionMatches(true, 0, "http://", 0, 7)) {
+            toast("The server must use https://");
+            return;
+        }
+        if (s.indexOf("://") < 0) s = "https://" + s;
+        final String server = s;
+        String host = Policy.host(server);
+        if (host == null || !server.regionMatches(true, 0, "https://", 0, 8)) {
+            toast("That server address doesn't look right");
+            return;
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("Hand over this tablet?")
+                .setMessage("Let " + host + " manage this tablet? Its settings will be locked, and only "
+                        + "that server can release it.")
+                .setPositiveButton("Enroll", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dlg, int which) {
+                        toast("Enrolling…");
+                        shepherd.enroll(server, code);
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void toast(String text) {
+        Toast.makeText(this, text, 1 /* LENGTH_LONG */).show();
     }
 }

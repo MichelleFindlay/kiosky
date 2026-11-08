@@ -16,11 +16,15 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.security.MessageDigest;
 import java.util.Random;
 
 /**
@@ -41,7 +45,7 @@ final class Updater {
         /** A newer release is available. Called on the main thread. */
         void onUpdateAvailable(String version, String apkUrl, long size);
         /** Download or install stopped without updating. Called on the main thread. */
-        void onInstallFailed();
+        void onInstallFailed(String reason);
     }
 
     private final Activity activity;
@@ -68,7 +72,7 @@ final class Updater {
                 busy = false;
                 String msg = i.getStringExtra("android.content.pm.extra.STATUS_MESSAGE");
                 toast("Update not installed" + (msg != null ? ": " + msg : ""));
-                listener.onInstallFailed();
+                listener.onInstallFailed(s == 3 ? "cancelled on the device" : (msg != null ? msg : "install status " + s));
             }
             // On success Android replaces the app; UpdateReceiver reopens it
         }
@@ -90,8 +94,20 @@ final class Updater {
         }
     }
 
+    static int currentVersionCode(Context c) {
+        try {
+            return c.getPackageManager().getPackageInfo(c.getPackageName(), 0).versionCode;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
     String version() {
         return current;
+    }
+
+    boolean isBusy() {
+        return busy;
     }
 
     void destroy() {
@@ -153,8 +169,12 @@ final class Updater {
         }).start();
     }
 
-    /** Downloads the APK into an install session and asks Android to install it. */
-    void install(final String apkUrl, final long size) {
+    /**
+     * Downloads an APK and asks Android to install it. {@code auth} is sent as the
+     * Authorization header (Shepherd downloads need it); when {@code sha256} is given,
+     * the download must match it or nothing is installed.
+     */
+    void install(final String apkUrl, final long size, final String auth, final String sha256) {
         if (busy) return;
 
         // Android 8+ needs "Install unknown apps" turned on for Kiosky (asked once)
@@ -163,7 +183,7 @@ final class Updater {
             Intent i = new Intent("android.settings.MANAGE_UNKNOWN_APP_SOURCES",
                     Uri.parse("package:" + activity.getPackageName()));
             activity.startActivity(i);
-            listener.onInstallFailed();
+            listener.onInstallFailed("install permission not granted");
             return;
         }
 
@@ -171,23 +191,45 @@ final class Updater {
         toast("Downloading update…");
         new Thread(new Runnable() {
             public void run() {
+                File apk = new File(activity.getCacheDir(), "update.apk");
                 PackageInstaller.Session session = null;
                 try {
+                    // 1. Download to a temporary file, hashing as we go
+                    HttpURLConnection c = open(apkUrl);
+                    if (auth != null) {
+                        c.setInstanceFollowRedirects(false); // keep the token on this server
+                        c.setRequestProperty("Authorization", auth);
+                    }
+                    if (c.getResponseCode() != 200) throw new IOException("download failed (" + c.getResponseCode() + ")");
+                    MessageDigest digest = MessageDigest.getInstance("SHA-256");
+                    InputStream in = c.getInputStream();
+                    OutputStream file = new FileOutputStream(apk);
+                    byte[] buf = new byte[65536];
+                    int n;
+                    while ((n = in.read(buf)) > 0) {
+                        digest.update(buf, 0, n);
+                        file.write(buf, 0, n);
+                    }
+                    file.close();
+                    in.close();
+                    c.disconnect();
+                    if (sha256 != null && !sha256.equalsIgnoreCase(hex(digest.digest()))) {
+                        throw new IOException("the download didn't match its checksum");
+                    }
+                    if (size > 0 && apk.length() != size) {
+                        throw new IOException("the download was incomplete");
+                    }
+
+                    // 2. Hand it to Android
                     PackageInstaller pi = activity.getPackageManager().getPackageInstaller();
                     int id = pi.createSession(new PackageInstaller.SessionParams(1 /* MODE_FULL_INSTALL */));
                     session = pi.openSession(id);
-
-                    HttpURLConnection c = open(apkUrl);
-                    if (c.getResponseCode() != 200) throw new IOException("download failed (" + c.getResponseCode() + ")");
-                    InputStream in = c.getInputStream();
-                    OutputStream out = session.openWrite("kiosky.apk", 0, size);
-                    byte[] buf = new byte[65536];
-                    int n;
-                    while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                    OutputStream out = session.openWrite("kiosky.apk", 0, apk.length());
+                    InputStream src = new FileInputStream(apk);
+                    while ((n = src.read(buf)) > 0) out.write(buf, 0, n);
+                    src.close();
                     session.fsync(out);
                     out.close();
-                    in.close();
-                    c.disconnect();
 
                     Intent cb = new Intent(ACTION_STATUS)
                             .setPackage(activity.getPackageName())
@@ -203,12 +245,20 @@ final class Updater {
                         public void run() {
                             busy = false;
                             toast("Update failed: " + e.getMessage());
-                            listener.onInstallFailed();
+                            listener.onInstallFailed(String.valueOf(e.getMessage()));
                         }
                     });
+                } finally {
+                    apk.delete();
                 }
             }
         }).start();
+    }
+
+    private static String hex(byte[] b) {
+        StringBuilder s = new StringBuilder(b.length * 2);
+        for (byte x : b) s.append(Character.forDigit((x >> 4) & 0xF, 16)).append(Character.forDigit(x & 0xF, 16));
+        return s.toString();
     }
 
     private HttpURLConnection open(String url) throws IOException {
