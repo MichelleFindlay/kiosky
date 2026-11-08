@@ -6,7 +6,8 @@ import android.content.Intent;
 
 /**
  * Reopens Kiosky after it has updated itself, since Android closes the app to
- * replace it. Android 10 and later may block this; then tap the Kiosky icon.
+ * replace it. Android 10 and later only allow this once Kiosky may display over
+ * other apps (the permission "Start on boot" asks for); otherwise tap the icon.
  */
 public class UpdateReceiver extends BroadcastReceiver {
     @Override

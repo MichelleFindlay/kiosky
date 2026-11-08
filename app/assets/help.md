@@ -34,6 +34,7 @@ the web page instead.
 | **Reload** | Reloads the current page |
 | **Help** | Shows this page (your saved address isn't changed) |
 | **Update** | Checks for a newer version of Kiosky |
+| **Start on boot** | Turns opening Kiosky automatically at start-up on or off |
 | **✕** | Hides the toolbar |
 
 The toolbar hides itself after 15 seconds unless you're typing in it.
@@ -47,7 +48,8 @@ When one is available, a bar appears along the bottom of the screen:
 2. The first time, Android asks you to let Kiosky install apps. Turn on
    **Allow from this source**, go back, and tap **Install** again.
 3. Confirm on Android's install screen. Kiosky closes, updates, and normally
-   reopens on its own. If it doesn't, tap the Kiosky icon.
+   reopens on its own. On Android 10 and later this needs the same permission as
+   **Start on boot** (below). If it doesn't reopen, tap the Kiosky icon.
 
 Tap **Later** to hide the bar until Kiosky next restarts. Your saved address,
 logins and settings are kept through updates.
@@ -55,6 +57,27 @@ logins and settings are kept through updates.
 Updates come from the project's releases on GitHub. Android only installs an
 update signed with the same key as the copy you already have, so a tampered file
 is refused.
+
+## Start automatically
+
+Kiosky can open by itself whenever the tablet is switched on or restarts, so a
+wall panel comes back after a power cut without anyone touching it. It's off
+until you turn it on:
+
+1. Open the toolbar and tap **Start on boot: Off**. It changes to **On**.
+2. On Android 10 and later, Kiosky then opens a settings screen. Turn on
+   **Display over other apps** (sometimes called *Appear on top*) for Kiosky,
+   then go back. Until you do, the button reads **Start on boot: Needs
+   permission**.
+3. Restart the tablet to check. Kiosky opens once start-up finishes, which can
+   take a minute.
+
+Kiosky opens after the tablet has been unlocked the first time, so for a wall
+panel set the screen lock to *None* or *Swipe*. Some brands (such as Xiaomi,
+Huawei and Oppo) also have their own *Autostart* setting that has to be turned on
+for Kiosky.
+
+Tap the button again to turn it off.
 
 ## Good to know
 

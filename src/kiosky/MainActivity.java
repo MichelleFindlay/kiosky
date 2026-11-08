@@ -1,9 +1,13 @@
 package kiosky;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.provider.Settings;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.inputmethod.InputMethodManager;
@@ -17,6 +21,7 @@ import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -27,8 +32,9 @@ public class MainActivity extends Activity {
     // Bundled instructions (app/assets/help.md), shown until an address is set
     private static final String HELP_URL = "file:///android_asset/help.md";
     private static final String DEFAULT_URL = HELP_URL;
-    private static final String PREFS = "kiosk";
+    static final String PREFS = "kiosk"; // also read by BootReceiver
     private static final String KEY_URL = "url";
+    static final String KEY_BOOT = "start_on_boot";
     private static final long RETRY_MS = 10000L;
     private static final long BAR_TIMEOUT_MS = 15000L;
     private static final long FIRST_CHECK_MS = 60 * 1000L;          // let Wi-Fi settle after launch
@@ -43,6 +49,7 @@ public class MainActivity extends Activity {
     private LinearLayout updateBar;
     private TextView updateText;
     private Button updateInstall;
+    private Button bootToggle;
     private String updateVersion, updateUrl, dismissedVersion;
     private long updateSize;
 
@@ -232,6 +239,15 @@ public class MainActivity extends Activity {
         });
         urlBar.addView(update, new LinearLayout.LayoutParams(-2, -2));
 
+        bootToggle = new Button(this);
+        bootToggle.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                setStartOnBoot(!startOnBoot());
+            }
+        });
+        urlBar.addView(bootToggle, new LinearLayout.LayoutParams(-2, -2));
+        refreshBootToggle();
+
         Button close = new Button(this);
         close.setText("✕");
         close.setOnClickListener(new View.OnClickListener() {
@@ -281,6 +297,52 @@ public class MainActivity extends Activity {
         updateBar.addView(later, new LinearLayout.LayoutParams(-2, -2));
 
         root.addView(updateBar, new FrameLayout.LayoutParams(-1, -2, 80 /* Gravity.BOTTOM */));
+    }
+
+    static boolean startOnBoot(android.content.Context c) {
+        return c.getSharedPreferences(PREFS, 0).getBoolean(KEY_BOOT, false);
+    }
+
+    private boolean startOnBoot() {
+        return startOnBoot(this);
+    }
+
+    /** Android 10+ only lets an app open itself at boot if it may display over other apps. */
+    private boolean canStartFromBackground() {
+        return Build.VERSION.SDK_INT < 29 || Settings.canDrawOverlays(this);
+    }
+
+    private void setStartOnBoot(boolean on) {
+        SharedPreferences.Editor ed = getSharedPreferences(PREFS, 0).edit();
+        ed.putBoolean(KEY_BOOT, on);
+        ed.apply();
+        refreshBootToggle();
+
+        if (on && !canStartFromBackground()) {
+            Toast.makeText(this, "Turn on \"Display over other apps\" for Kiosky so it can open "
+                    + "when the tablet starts, then go back", 1 /* LENGTH_LONG */).show();
+            try {
+                startActivity(new Intent("android.settings.action.MANAGE_OVERLAY_PERMISSION",
+                        Uri.parse("package:" + getPackageName())));
+            } catch (Exception e) {
+                Toast.makeText(this, "Open Settings › Apps › Kiosky and allow "
+                        + "\"Display over other apps\"", 1).show();
+            }
+        } else {
+            Toast.makeText(this, on ? "Kiosky will open when the tablet starts"
+                    : "Kiosky won't open on its own at start-up", 0 /* LENGTH_SHORT */).show();
+        }
+    }
+
+    private void refreshBootToggle() {
+        if (bootToggle == null) return;
+        if (!startOnBoot()) {
+            bootToggle.setText("Start on boot: Off");
+        } else if (!canStartFromBackground()) {
+            bootToggle.setText("Start on boot: Needs permission");
+        } else {
+            bootToggle.setText("Start on boot: On");
+        }
     }
 
     private String savedUrl() {
@@ -417,6 +479,7 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         keepScreenOn(); // re-apply after returning from Settings or the install screen
+        refreshBootToggle(); // the permission may have just been granted
         goImmersive();
         if (web != null) web.onResume();
     }

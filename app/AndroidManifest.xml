@@ -1,8 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="uk.lp0.ha" android:versionCode="10001" android:versionName="1.0.1">
+    package="uk.lp0.ha" android:versionCode="10002" android:versionName="1.0.2">
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <!-- Android 10+ only lets apps open at boot (or after updating) with this granted -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
     <application android:label="@string/app_name" android:icon="@mipmap/ic_launcher"
         android:allowBackup="false" android:hardwareAccelerated="true" android:usesCleartextTraffic="false"
         android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
@@ -14,6 +17,13 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <receiver android:name="kiosky.BootReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON"/>
+            </intent-filter>
+        </receiver>
         <receiver android:name="kiosky.UpdateReceiver" android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
