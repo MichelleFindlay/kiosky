@@ -1,0 +1,19 @@
+version: 2.10.0
+apkFileName: ha-lp0.apk
+isFrameworkApk: false
+usesFramework:
+  ids:
+  - 1
+  tag: null
+sdkInfo:
+  minSdkVersion: 22
+  targetSdkVersion: 30
+packageInfo:
+  forcedPackageId: 127
+  renameManifestPackage: null
+versionInfo:
+  versionCode: 2
+  versionName: 1.1
+doNotCompress:
+- resources.arsc
+- png
