@@ -7,5 +7,6 @@ public class AlertDialog implements DialogInterface {
   public Builder setPositiveButton(CharSequence t,DialogInterface.OnClickListener l){return this;}
   public Builder setNegativeButton(CharSequence t,DialogInterface.OnClickListener l){return this;}
   public Builder setNeutralButton(CharSequence t,DialogInterface.OnClickListener l){return this;}
+  public Builder setItems(CharSequence[] items,DialogInterface.OnClickListener l){return this;}
   public Builder setOnDismissListener(DialogInterface.OnDismissListener l){return this;}
   public AlertDialog show(){return null;} } }

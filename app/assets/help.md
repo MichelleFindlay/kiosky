@@ -88,23 +88,40 @@ Normally, anyone can pull down the notification shade or press Home to leave
 Kiosky. **Lockdown** stops that: Kiosky's own menu becomes the only way out.
 
 1. Open the toolbar and tap **Lockdown: Off**.
-2. Swipe in from an edge to open Kiosky's menu at any time, and tap **Lockdown:
-   On** to unlock again. If a swipe shows nothing, **tap the top-left corner five
-   times quickly** to open the menu instead.
+2. Unless Kiosky is the device owner, a checklist opens. Tap each **✗** item to
+   switch it on (see below), then go back to Kiosky.
+3. To unlock, swipe in from an edge to open Kiosky's menu, tap **Lockdown: On**,
+   then **Turn off lockdown**. If a swipe shows nothing, **tap the top-left corner
+   five times quickly** to open the menu instead.
 
-How strong the lock is depends on whether Kiosky is the tablet's *device owner*.
+### How strong is it?
 
-| | Device owner | Not device owner |
+Android only lets the tablet's *device owner* (or an MDM) lock it completely. That
+works on every Android version and the button reads **Lockdown: On** (or **On
+(MDM)**). Otherwise it reads **Lockdown: On (partial)**, and Kiosky combines
+everything Android allows. Each checklist item closes another gap:
+
+| Checklist item | What it does | Android versions |
 | --- | --- | --- |
-| Notification shade | Turned off | Closed again as soon as it opens (see below) |
-| Home, Recents | Blocked | Blocked |
+| **Accessibility helper** | Brings Kiosky straight back if another app, the Home screen or Recents opens. Closes the notification shade on Android 12+ | All |
+| **Display over other apps** | Blocks the notification shade (up to 7.1). Lets Kiosky come back when left (10+) | 6.0 and later |
+| **Kiosky is the Home app** | The Home button returns to Kiosky | All |
+| **Screen pinning** | Blocks Home and Recents. Turn on *Ask for PIN before unpinning* so it can't simply be undone | All |
+
+Kiosky also closes the notification shade by itself whenever it's pulled down,
+which works up to Android 11 without the helper.
+
+| | Device owner or MDM | Partial, all items ✓ |
+| --- | --- | --- |
+| Notification shade | Turned off | Closed straight away (up to 11 by itself, 12+ with the helper) |
+| Home, Recents | Blocked | Blocked by pinning, and Kiosky comes back if they're reached |
 | Power menu and lock screen | Blocked | Still work |
-| Leaving without Kiosky's menu | Not possible | Hold **Back** and **Recents** to unpin |
+| Settings | Can't be reached | Kiosky comes back if it opens |
 | Updates | Install without a prompt | Android asks to confirm |
 
-Without device owner, Kiosky uses Android's *app pinning*. Turn on **Ask for PIN
-before unpinning** (Settings › Security › App pinning) so people can't just unpin
-it.
+> **Android 13 and later:** Android greys out the accessibility switch for apps
+> that weren't installed from an app store. Open **App info › ⋮ › Allow restricted
+> settings** for Kiosky first (the checklist has a shortcut), then turn the helper on.
 
 ### Make Kiosky the device owner
 
@@ -180,9 +197,9 @@ missing permissions. After five wrong PINs, PIN entry is locked for 5 minutes.
 - **Links stay inside Kiosky.** Nothing opens in another app or browser.
 - **Notification shade:** whenever Kiosky is on screen, it stops people pulling
   down the notification shade, even with Lockdown off. As device owner the shade
-  is turned off completely. Otherwise Kiosky closes it as soon as it opens, which
-  works on most tablets up to Android 11. Android 12 and later restrict this, so
-  make Kiosky the device owner there.
+  is turned off completely. Otherwise Kiosky closes it as soon as it opens: by
+  itself up to Android 11, and with the accessibility helper on Android 12 and
+  later (see *Lock the tablet down*).
 - **Screen stays on** while Kiosky is open. To dim it at night, use the
   tablet's own schedule or your dashboard's settings.
 - **Sound and video** can play without a tap first, which suits cameras and

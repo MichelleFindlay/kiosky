@@ -43,7 +43,7 @@ public class MainActivity extends Activity {
     static final String PREFS = "kiosk"; // also read by BootReceiver
     private static final String KEY_URL = "url";
     static final String KEY_BOOT = "start_on_boot";
-    private static final String KEY_LOCKDOWN = "lockdown";
+    static final String KEY_LOCKDOWN = "lockdown";
     private static final String DEFAULT_URL = Pages.HELP_URL; // instructions until an address is set
     private static final long RETRY_MS = 10000L;
     private static final long BAR_TIMEOUT_MS = 15000L;
@@ -142,7 +142,7 @@ public class MainActivity extends Activity {
     private final Runnable closeShade = new Runnable() {
         public void run() {
             if (!resumed || hasWindowFocus() || ownDialogs > 0) return;
-            collapseShade();
+            Lockdown.collapseShade(MainActivity.this);
         }
     };
 
@@ -236,6 +236,8 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         resumed = true;
+        Lockdown.allowLeaveUntil = 0; // back in Kiosky: any planned trip away is over
+        handler.removeCallbacks(returnToKiosky);
         setStatusBarBlocked(true);
         applyScreenOn(); // re-apply after returning from Settings or the install screen
         refreshToolbar(); // permissions may have just been granted
@@ -248,6 +250,7 @@ public class MainActivity extends Activity {
     protected void onPause() {
         resumed = false;
         setStatusBarBlocked(false); // Settings or an install prompt may need it
+        statusBarBlocker.hide(this);
         if (web != null) web.onPause();
         CookieManager.getInstance().flush();
         super.onPause();
@@ -292,6 +295,8 @@ public class MainActivity extends Activity {
         handler.removeCallbacks(periodicReload);
         handler.removeCallbacks(enforceLockdown);
         handler.removeCallbacks(closeShade);
+        handler.removeCallbacks(returnToKiosky);
+        statusBarBlocker.hide(this);
         try {
             unregisterReceiver(network);
         } catch (Exception ignored) {
@@ -472,7 +477,7 @@ public class MainActivity extends Activity {
         });
         lockToggle = button("", new Runnable() {
             public void run() {
-                setLockdown(!lockdownWanted());
+                lockdownTapped();
             }
         });
         ownerButton = button("Remove device owner", new Runnable() {
@@ -658,7 +663,9 @@ public class MainActivity extends Activity {
         show(infoButton, isManaged && unlocked);
         boolean owner = isDeviceOwner();
         show(lockToggle, !isManaged || unlocked); // managed: only after the technician PIN
-        lockToggle.setText(!lockdownWanted() ? "Lockdown: Off" : (owner ? "Lockdown: On" : "Lockdown: On (pinned)"));
+        String mode = Lockdown.mode(this);
+        lockToggle.setText(!lockdownWanted() ? "Lockdown: Off"
+                : ("owner".equals(mode) ? "Lockdown: On" : ("mdm".equals(mode) ? "Lockdown: On (MDM)" : "Lockdown: On (partial)")));
         show(ownerButton, owner && !lockdownWanted() && (!isManaged || unlocked));
         show(corner, isManaged ? policy.pin != null : lockdownWanted());
         show(overlayButton, isManaged && unlocked && policy.startOnBoot && !DeviceInfo.overlayPermission(this));
@@ -757,6 +764,9 @@ public class MainActivity extends Activity {
             Json.put(s, "device_owner", isDeviceOwner());
             Json.put(s, "lockdown", lockdownWanted());
             Json.put(s, "lock_task", inLockTask());
+            Json.put(s, "lockdown_mode", Lockdown.mode(MainActivity.this));
+            Json.put(s, "accessibility_helper", KioskAccessibility.running());
+            Json.put(s, "default_home", Lockdown.isDefaultHome(MainActivity.this));
             return s;
         }
 
@@ -960,6 +970,7 @@ public class MainActivity extends Activity {
         managed.addEvent("update_started", Json.obj("version", updateVersion, "version_code", updateCode));
         // A device owner installs silently; a pinned tablet must unpin so Android's prompt can show
         if (!isDeviceOwner()) leaveLockForExternalScreen();
+        else Lockdown.allowLeave(10 * 60 * 1000L);
         updater.install(updateUrl, updateSize, updateAuth, updateSha);
     }
 
@@ -1014,49 +1025,59 @@ public class MainActivity extends Activity {
     }
 
     // ======================================================================
-    // Lockdown (Android lock task mode)
+    // Lockdown (see Lockdown.java for the layers and where each one works)
     // ======================================================================
-    //
-    // As device owner, Kiosky whitelists itself for lock task mode with no system
-    // features: no notification shade, Home, Recents, power menu or lock screen, and
-    // Kiosky's own toolbar is the only way out. Otherwise Android falls back to
-    // screen pinning, which a person can undo unless unpinning asks for a PIN.
+
+    private final Lockdown.StatusBarBlocker statusBarBlocker = new Lockdown.StatusBarBlocker();
 
     private final Runnable enforceLockdown = new Runnable() {
         public void run() {
-            if (!lockdownWanted() || inLockTask()) return;
+            if (!lockdownWanted() || !resumed) return;
+            statusBarBlocker.show(MainActivity.this);
+            if (inLockTask()) return;
             try {
-                if (isDeviceOwner()) {
-                    DevicePolicyManager dpm = dpm();
+                if (Lockdown.isOwner(MainActivity.this)) {
+                    DevicePolicyManager dpm = Lockdown.dpm(MainActivity.this);
                     dpm.setLockTaskPackages(admin(), new String[] {getPackageName()});
                     if (Build.VERSION.SDK_INT >= 28) dpm.setLockTaskFeatures(admin(), 0 /* LOCK_TASK_FEATURE_NONE */);
                 }
-                startLockTask();
+                if (!Lockdown.fullLockPossible(MainActivity.this)) {
+                    Lockdown.quietUntil = System.currentTimeMillis() + 5000; // let the pin prompt show
+                }
+                startLockTask(); // full lock task if allowed, screen pinning otherwise
             } catch (Exception e) {
                 // Not in front yet, or refused; the next resume tries again
             }
         }
     };
 
-    private boolean lockdownWanted() {
-        return getSharedPreferences(PREFS, 0).getBoolean(KEY_LOCKDOWN, false);
+    /** Brings Kiosky back after it was left without going through its menu. */
+    private final Runnable returnToKiosky = new Runnable() {
+        public void run() {
+            if (!resumed && lockdownWanted() && !Lockdown.leaveAllowed() && !isFinishing()) {
+                Lockdown.bringToFront(MainActivity.this);
+            }
+        }
+    };
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        if (lockdownWanted() && !Lockdown.leaveAllowed() && !Lockdown.fullLockPossible(this)) {
+            handler.postDelayed(returnToKiosky, 300);
+        }
     }
 
-    private DevicePolicyManager dpm() {
-        return (DevicePolicyManager) getSystemService("device_policy");
+    private boolean lockdownWanted() {
+        return Lockdown.wanted(this);
     }
 
     private ComponentName admin() {
-        return new ComponentName(this, AdminReceiver.class);
+        return Lockdown.admin(this);
     }
 
     private boolean isDeviceOwner() {
-        try {
-            DevicePolicyManager dpm = dpm();
-            return dpm != null && dpm.isDeviceOwnerApp(getPackageName());
-        } catch (Exception e) {
-            return false;
-        }
+        return Lockdown.isOwner(this);
     }
 
     private boolean inLockTask() {
@@ -1069,43 +1090,132 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** The toolbar's Lockdown button. */
+    private void lockdownTapped() {
+        if (!lockdownWanted()) {
+            setLockdown(true);
+            if (Lockdown.fullLockPossible(this)) {
+                dismissToolbar();
+                toast("Locked down. Swipe in from an edge, or tap the top-left corner five times, to open Kiosky's menu");
+            } else {
+                showLockdownChecklist();
+            }
+        } else {
+            showLockdownChecklist();
+        }
+    }
+
     private void setLockdown(boolean on) {
         SharedPreferences.Editor ed = getSharedPreferences(PREFS, 0).edit();
         ed.putBoolean(KEY_LOCKDOWN, on);
         ed.apply();
-        managed.addEvent(on ? "lockdown_on" : "lockdown_off", null);
-        if (!on) {
+        managed.addEvent(on ? "lockdown_on" : "lockdown_off", Json.obj("mode", Lockdown.mode(this)));
+        Lockdown.setHome(this, on);
+        if (on) {
+            handler.post(enforceLockdown);
+        } else {
+            handler.removeCallbacks(returnToKiosky);
+            statusBarBlocker.hide(this);
             stopLock();
             toast("Lockdown is off. The system menus and buttons work again");
-            refreshToolbar();
+        }
+        refreshToolbar();
+    }
+
+    /**
+     * Shows how strong the lockdown is and lets each missing layer be switched on.
+     * Tapping an item opens the right settings screen; Lockdown resumes on return.
+     */
+    private void showLockdownChecklist() {
+        final boolean on = lockdownWanted();
+        String mode = Lockdown.mode(this);
+        if (!"partial".equals(mode)) {
+            dialog().setTitle("owner".equals(mode) ? "Full lockdown (device owner)" : "Full lockdown (MDM)")
+                    .setMessage("The notification shade, Home, Recents and the power menu are blocked. "
+                            + "Kiosky's menu is the only way out.")
+                    .setPositiveButton(on ? "Turn off lockdown" : "Turn on lockdown", new DialogInterface.OnClickListener() {
+                        public void onClick(DialogInterface d, int w) {
+                            setLockdown(!on);
+                        }
+                    })
+                    .setNegativeButton("Close", null)
+                    .show();
             return;
         }
-        if (isDeviceOwner()) {
-            dismissToolbar();
-            handler.post(enforceLockdown);
-            toast("Locked down. Swipe in from an edge to open Kiosky's menu");
-            return;
+
+        final java.util.List<String> labels = new java.util.ArrayList<String>();
+        final java.util.List<Runnable> actions = new java.util.ArrayList<Runnable>();
+        int sdk = Build.VERSION.SDK_INT;
+
+        boolean helper = KioskAccessibility.running();
+        labels.add((helper ? "✓ " : "✗ ") + "Accessibility helper: returns to Kiosky if it's left"
+                + (sdk >= 31 ? " and closes the notification shade" : "") + (helper ? "" : " (tap to turn on)"));
+        actions.add(new Runnable() {
+            public void run() {
+                toast("Turn on Kiosky under Installed apps or Downloaded apps, then go back");
+                openScreen(new Intent("android.settings.ACCESSIBILITY_SETTINGS"));
+            }
+        });
+        if (sdk >= 33 && !helper) {
+            labels.add("   If Kiosky is greyed out there: App info › ⋮ › Allow restricted settings (tap)");
+            actions.add(new Runnable() {
+                public void run() {
+                    openSettings("android.settings.APPLICATION_DETAILS_SETTINGS");
+                }
+            });
         }
-        dialog()
-                .setTitle("Partial lockdown")
-                .setMessage("Kiosky isn't this tablet's device owner, so Android will pin it instead. "
-                        + "Pinning hides the notification shade and blocks Home and Recents, but someone can "
-                        + "still unpin it by holding Back and Recents.\n\nTo stop that, turn on \"Ask for PIN "
-                        + "before unpinning\" in Settings › Security › App pinning.\n\nFor full lockdown, make "
-                        + "Kiosky the device owner. The help page explains how.")
-                .setPositiveButton("Pin Kiosky", new DialogInterface.OnClickListener() {
-                    public void onClick(DialogInterface dlg, int which) {
-                        dismissToolbar();
-                        handler.post(enforceLockdown);
+        if (sdk >= 23) {
+            boolean overlay = android.provider.Settings.canDrawOverlays(this);
+            String what = sdk < 26 ? "blocks the notification shade" : (sdk >= 29 ? "lets Kiosky return when it's left" : "start on boot");
+            labels.add((overlay ? "✓ " : "✗ ") + "Display over other apps: " + what + (overlay ? "" : " (tap to allow)"));
+            actions.add(new Runnable() {
+                public void run() {
+                    openSettings("android.settings.action.MANAGE_OVERLAY_PERMISSION");
+                }
+            });
+        }
+        boolean home = Lockdown.isDefaultHome(this);
+        labels.add((home ? "✓ " : "✗ ") + "Kiosky is the Home app: the Home button comes back here" + (home ? "" : " (tap to choose)"));
+        actions.add(new Runnable() {
+            public void run() {
+                toast("Choose Kiosky as the Home app, then go back");
+                if (!openScreen(new Intent("android.settings.HOME_SETTINGS"))) {
+                    openScreen(new Intent("android.intent.action.MAIN").addCategory("android.intent.category.HOME"));
+                }
+            }
+        });
+        labels.add("• Screen pinning: blocks Home and Recents. Turn on \"Ask for PIN before unpinning\" (tap)");
+        actions.add(new Runnable() {
+            public void run() {
+                toast("Find App pinning (or Screen pinning) and turn on asking for a PIN to unpin");
+                openScreen(new Intent("android.settings.SECURITY_SETTINGS"));
+            }
+        });
+        labels.add("• For full lockdown on any Android version, make Kiosky the device owner (tap for help)");
+        actions.add(new Runnable() {
+            public void run() {
+                showHelp();
+                dismissToolbar();
+            }
+        });
+
+        dialog().setTitle(on ? "Lockdown is on (partial)" : "Lockdown")
+                .setItems(labels.toArray(new CharSequence[0]), new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int which) {
+                        actions.get(which).run();
                     }
                 })
-                .setNegativeButton("Cancel", new DialogInterface.OnClickListener() {
-                    public void onClick(DialogInterface dlg, int which) {
-                        setLockdown(false);
+                .setPositiveButton(on ? "Turn off lockdown" : "Turn on lockdown", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) {
+                        setLockdown(!on);
+                    }
+                })
+                .setNegativeButton("Close", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) {
+                        if (lockdownWanted()) dismissToolbar();
                     }
                 })
                 .show();
-        refreshToolbar();
     }
 
     // ======================================================================
@@ -1114,34 +1224,14 @@ public class MainActivity extends Activity {
 
     /**
      * As device owner, turns the notification shade off while Kiosky is in front
-     * (Android 6+). This is the only reliable way; Android gives ordinary apps none.
+     * (Android 6+). This is the only fully reliable way.
      */
     private void setStatusBarBlocked(boolean blocked) {
         if (Build.VERSION.SDK_INT < 23 || !isDeviceOwner()) return;
         try {
-            dpm().setStatusBarDisabled(admin(), blocked);
+            Lockdown.dpm(this).setStatusBarDisabled(admin(), blocked);
         } catch (Exception ignored) {
             // not permitted on this device
-        }
-    }
-
-    /**
-     * Without device owner: closes the shade as soon as it opens over Kiosky. Works on
-     * most tablets up to Android 11; Android 12+ restricts both methods.
-     */
-    private void collapseShade() {
-        try {
-            Object sb = getSystemService("statusbar");
-            Class.forName("android.app.StatusBarManager").getMethod("collapsePanels").invoke(sb);
-        } catch (Throwable ignored) {
-            // hidden API not available
-        }
-        if (Build.VERSION.SDK_INT < 31) {
-            try {
-                sendBroadcast(new Intent("android.intent.action.CLOSE_SYSTEM_DIALOGS"));
-            } catch (Throwable ignored) {
-                // refused
-            }
         }
     }
 
@@ -1163,9 +1253,24 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** Settings, scanners and install prompts can't open over a locked task. Resume re-locks. */
+    /**
+     * Before opening Settings, a scanner or an install prompt on purpose: lets Kiosky
+     * be left for a while, and unlocks the task so the screen can open. Resume re-locks.
+     */
     private void leaveLockForExternalScreen() {
+        Lockdown.allowLeave(10 * 60 * 1000L);
         if (lockdownWanted()) stopLock();
+    }
+
+    /** Opens a system screen without a package address. Returns false if there's none. */
+    private boolean openScreen(Intent i) {
+        leaveLockForExternalScreen();
+        try {
+            startActivity(i);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private void confirmRemoveOwner() {
@@ -1178,7 +1283,8 @@ public class MainActivity extends Activity {
                         stopLock();
                         try {
                             setStatusBarBlocked(false);
-                            dpm().clearDeviceOwnerApp(getPackageName());
+                            Lockdown.setHome(MainActivity.this, false);
+                            Lockdown.dpm(MainActivity.this).clearDeviceOwnerApp(getPackageName());
                             toast("Kiosky is no longer the device owner");
                         } catch (Exception e) {
                             toast("Couldn't remove device owner: " + e.getMessage());

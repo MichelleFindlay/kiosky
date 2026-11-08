@@ -1,2 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<resources><string name="app_name">Kiosky</string></resources>
+<resources>
+    <string name="app_name">Kiosky</string>
+    <string name="accessibility_description">Keeps Kiosky on screen while Lockdown is on. If another app, the Home screen or Recents opens, Kiosky comes back, and on Android 12 and later it closes the notification shade. Kiosky only checks which app is in front; it doesn\'t read what\'s on the screen. It does nothing while Lockdown is off.</string>
+</resources>
