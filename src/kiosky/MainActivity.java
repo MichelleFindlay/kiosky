@@ -135,6 +135,17 @@ public class MainActivity extends Activity {
         }
     };
 
+    // Notification shade blocking
+    private boolean resumed;
+    private int ownDialogs; // our dialogs take focus too; don't mistake them for the shade
+
+    private final Runnable closeShade = new Runnable() {
+        public void run() {
+            if (!resumed || hasWindowFocus() || ownDialogs > 0) return;
+            collapseShade();
+        }
+    };
+
     private final BroadcastReceiver network = new BroadcastReceiver() {
         @Override
         public void onReceive(Context c, Intent i) {
@@ -214,11 +225,18 @@ public class MainActivity extends Activity {
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus && (urlBar == null || urlBar.getVisibility() != 0)) goImmersive();
+        // Losing focus while still in front, with none of our own dialogs open, means
+        // the notification shade (or another system panel) was pulled over Kiosky
+        if (!hasFocus && resumed && ownDialogs == 0) {
+            for (long delay : new long[] {0, 100, 250, 500, 1000, 2000}) handler.postDelayed(closeShade, delay);
+        }
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        resumed = true;
+        setStatusBarBlocked(true);
         applyScreenOn(); // re-apply after returning from Settings or the install screen
         refreshToolbar(); // permissions may have just been granted
         goImmersive();
@@ -228,6 +246,8 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
+        resumed = false;
+        setStatusBarBlocked(false); // Settings or an install prompt may need it
         if (web != null) web.onPause();
         CookieManager.getInstance().flush();
         super.onPause();
@@ -271,6 +291,7 @@ public class MainActivity extends Activity {
         handler.removeCallbacks(autoCheck);
         handler.removeCallbacks(periodicReload);
         handler.removeCallbacks(enforceLockdown);
+        handler.removeCallbacks(closeShade);
         try {
             unregisterReceiver(network);
         } catch (Exception ignored) {
@@ -1065,7 +1086,7 @@ public class MainActivity extends Activity {
             toast("Locked down. Swipe in from an edge to open Kiosky's menu");
             return;
         }
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle("Partial lockdown")
                 .setMessage("Kiosky isn't this tablet's device owner, so Android will pin it instead. "
                         + "Pinning hides the notification shade and blocks Home and Recents, but someone can "
@@ -1087,6 +1108,53 @@ public class MainActivity extends Activity {
         refreshToolbar();
     }
 
+    // ======================================================================
+    // Notification shade
+    // ======================================================================
+
+    /**
+     * As device owner, turns the notification shade off while Kiosky is in front
+     * (Android 6+). This is the only reliable way; Android gives ordinary apps none.
+     */
+    private void setStatusBarBlocked(boolean blocked) {
+        if (Build.VERSION.SDK_INT < 23 || !isDeviceOwner()) return;
+        try {
+            dpm().setStatusBarDisabled(admin(), blocked);
+        } catch (Exception ignored) {
+            // not permitted on this device
+        }
+    }
+
+    /**
+     * Without device owner: closes the shade as soon as it opens over Kiosky. Works on
+     * most tablets up to Android 11; Android 12+ restricts both methods.
+     */
+    private void collapseShade() {
+        try {
+            Object sb = getSystemService("statusbar");
+            Class.forName("android.app.StatusBarManager").getMethod("collapsePanels").invoke(sb);
+        } catch (Throwable ignored) {
+            // hidden API not available
+        }
+        if (Build.VERSION.SDK_INT < 31) {
+            try {
+                sendBroadcast(new Intent("android.intent.action.CLOSE_SYSTEM_DIALOGS"));
+            } catch (Throwable ignored) {
+                // refused
+            }
+        }
+    }
+
+    /** All of Kiosky's dialogs go through here, so they aren't mistaken for the shade. */
+    private AlertDialog.Builder dialog() {
+        ownDialogs++;
+        return new AlertDialog.Builder(this).setOnDismissListener(new DialogInterface.OnDismissListener() {
+            public void onDismiss(DialogInterface d) {
+                if (ownDialogs > 0) ownDialogs--;
+            }
+        });
+    }
+
     private void stopLock() {
         try {
             if (inLockTask()) stopLockTask();
@@ -1101,7 +1169,7 @@ public class MainActivity extends Activity {
     }
 
     private void confirmRemoveOwner() {
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle("Remove device owner?")
                 .setMessage("Full lockdown won't be possible until Kiosky is made device owner again with adb. "
                         + "Do this before uninstalling Kiosky: Android won't uninstall a device owner.")
@@ -1109,6 +1177,7 @@ public class MainActivity extends Activity {
                     public void onClick(DialogInterface dlg, int which) {
                         stopLock();
                         try {
+                            setStatusBarBlocked(false);
                             dpm().clearDeviceOwnerApp(getPackageName());
                             toast("Kiosky is no longer the device owner");
                         } catch (Exception e) {
@@ -1135,7 +1204,7 @@ public class MainActivity extends Activity {
         final EditText field = new EditText(this);
         field.setInputType(0x12 /* TYPE_CLASS_NUMBER | TYPE_NUMBER_VARIATION_PASSWORD */);
         field.setHint("PIN");
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle("Technician PIN")
                 .setView(field)
                 .setPositiveButton("Unlock", new DialogInterface.OnClickListener() {
@@ -1186,7 +1255,7 @@ public class MainActivity extends Activity {
         b.append("\nStatus: ").append(shepherd.lastError != null ? shepherd.lastError : "OK");
         b.append("\nStart on boot permission: ").append(DeviceInfo.overlayPermission(this) ? "granted" : "missing");
         b.append("\nInstall permission: ").append(DeviceInfo.installPermission(this) ? "granted" : "missing");
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle("Device info")
                 .setMessage(b.toString())
                 .setPositiveButton("OK", null)
@@ -1238,7 +1307,7 @@ public class MainActivity extends Activity {
         if (code != null) codeField.setText(code);
         form.addView(codeField, new LinearLayout.LayoutParams(-1, -2));
 
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle("Enroll with a Shepherd server")
                 .setMessage("Enter the server and code from your administrator, or scan its QR code.")
                 .setView(form)
@@ -1288,7 +1357,7 @@ public class MainActivity extends Activity {
             return;
         }
 
-        new AlertDialog.Builder(this)
+        dialog()
                 .setTitle("Hand over this tablet?")
                 .setMessage("Let " + host + " manage this tablet? Its settings will be locked, and only "
                         + "that server can release it.")

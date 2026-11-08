@@ -1,10 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="uk.lp0.ha" android:versionCode="10200" android:versionName="1.2.0">
+    package="uk.lp0.ha" android:versionCode="10201" android:versionName="1.2.1">
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <!-- Lets Kiosky close the notification shade when it's pulled over the app -->
+    <uses-permission android:name="android.permission.EXPAND_STATUS_BAR"/>
     <!-- Android 10+ only lets apps open at boot (or after updating) with this granted -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
     <application android:label="@string/app_name" android:icon="@mipmap/ic_launcher"

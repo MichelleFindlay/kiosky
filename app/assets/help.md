@@ -96,7 +96,8 @@ How strong the lock is depends on whether Kiosky is the tablet's *device owner*.
 
 | | Device owner | Not device owner |
 | --- | --- | --- |
-| Notification shade, Home, Recents | Blocked | Blocked |
+| Notification shade | Turned off | Closed again as soon as it opens (see below) |
+| Home, Recents | Blocked | Blocked |
 | Power menu and lock screen | Blocked | Still work |
 | Leaving without Kiosky's menu | Not possible | Hold **Back** and **Recents** to unpin |
 | Updates | Install without a prompt | Android asks to confirm |
@@ -177,6 +178,11 @@ missing permissions. After five wrong PINs, PIN entry is locked for 5 minutes.
 - **Lost connection?** If the page can't be reached (Wi-Fi waking up, server
   restarting), Kiosky tries again every 10 seconds on its own.
 - **Links stay inside Kiosky.** Nothing opens in another app or browser.
+- **Notification shade:** whenever Kiosky is on screen, it stops people pulling
+  down the notification shade, even with Lockdown off. As device owner the shade
+  is turned off completely. Otherwise Kiosky closes it as soon as it opens, which
+  works on most tablets up to Android 11. Android 12 and later restrict this, so
+  make Kiosky the device owner there.
 - **Screen stays on** while Kiosky is open. To dim it at night, use the
   tablet's own schedule or your dashboard's settings.
 - **Sound and video** can play without a tap first, which suits cameras and
