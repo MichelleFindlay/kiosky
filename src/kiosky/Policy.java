@@ -29,6 +29,7 @@ final class Policy {
     final boolean keepScreenOn;
     final String orientation;
     final boolean allowExit;
+    final boolean lockdown;
 
     final String toolbarMode;        // hidden | limited | full
     final int toolbarTimeoutSeconds;
@@ -60,6 +61,7 @@ final class Policy {
         keepScreenOn = p.optBoolean("keep_screen_on", true);
         orientation = Json.str(p, "orientation", "auto");
         allowExit = p.optBoolean("allow_exit", false);
+        lockdown = p.optBoolean("lockdown", false);
 
         JSONObject tb = p.optJSONObject("toolbar");
         String mode = Json.str(tb, "mode", "hidden");

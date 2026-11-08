@@ -41,8 +41,21 @@ final class Lockdown {
 
     private Lockdown() {}
 
+    /** Managed: the policy's "lockdown" setting decides. Unmanaged: the local toggle. */
     static boolean wanted(Context c) {
+        if (ManagedState.isManaged(c)) {
+            Policy p = ManagedState.cachedPolicy(c);
+            return p != null && p.lockdown;
+        }
+        return localSetting(c);
+    }
+
+    static boolean localSetting(Context c) {
         return c.getSharedPreferences(MainActivity.PREFS, 0).getBoolean(MainActivity.KEY_LOCKDOWN, false);
+    }
+
+    static void setLocalSetting(Context c, boolean on) {
+        c.getSharedPreferences(MainActivity.PREFS, 0).edit().putBoolean(MainActivity.KEY_LOCKDOWN, on).apply();
     }
 
     static void allowLeave(long ms) {

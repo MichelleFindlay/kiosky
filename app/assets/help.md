@@ -140,8 +140,10 @@ This is done once per tablet, from a computer with
 > A device owner can't be uninstalled. To remove Kiosky later, turn Lockdown off
 > and tap **Remove device owner** first, or factory-reset the tablet.
 
-On a tablet managed by Shepherd, **Lockdown** and **Remove device owner** only
-appear after the technician PIN.
+On a tablet managed by Shepherd, the administrator turns Lockdown on or off with
+the **Lock the tablet to Kiosky** setting, and the tablet can't change it. After the
+technician PIN, the **Lockdown** button opens the checklist so the missing items
+can be switched on, and **Remove device owner** appears while lockdown is off.
 
 ## Managed tablets (Shepherd)
 

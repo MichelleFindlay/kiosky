@@ -662,7 +662,8 @@ public class MainActivity extends Activity {
         show(enrollButton, !isManaged);
         show(infoButton, isManaged && unlocked);
         boolean owner = isDeviceOwner();
-        show(lockToggle, !isManaged || unlocked); // managed: only after the technician PIN
+        // Managed: the policy decides; after the technician PIN the checklist can still be opened
+        show(lockToggle, !isManaged || (unlocked && policy.lockdown));
         String mode = Lockdown.mode(this);
         lockToggle.setText(!lockdownWanted() ? "Lockdown: Off"
                 : ("owner".equals(mode) ? "Lockdown: On" : ("mdm".equals(mode) ? "Lockdown: On (MDM)" : "Lockdown: On (partial)")));
@@ -772,8 +773,10 @@ public class MainActivity extends Activity {
 
         public void onPolicy(Policy p) {
             String oldUrl = policy != null ? policy.url : null;
+            boolean wasLocked = lockdownWanted();
             policy = p;
             applyPolicySettings();
+            if (p.lockdown != wasLocked) applyLockdown(p.lockdown, true);
             if (oldUrl == null || !oldUrl.equals(p.url) || onTemporaryPage) loadHome();
             managed.setApplied(p.version);
             managed.addEvent("policy_applied", Json.obj("version", p.version));
@@ -800,6 +803,7 @@ public class MainActivity extends Activity {
             SharedPreferences.Editor ed = getSharedPreferences(PREFS, 0).edit();
             if (last != null && last.url.length() > 0) ed.putString(KEY_URL, last.url);
             if (last != null) ed.putBoolean(KEY_BOOT, last.startOnBoot);
+            ed.putBoolean(KEY_LOCKDOWN, last != null && last.lockdown); // stays as it was
             ed.apply();
             boolean waiting = Pages.WAITING_URL.equals(web.getUrl()) || (last != null && last.url.length() == 0);
             policy = null;
@@ -811,8 +815,10 @@ public class MainActivity extends Activity {
         }
 
         public void onEnrolled(Policy p, String name) {
+            boolean wasLocked = lockdownWanted();
             policy = p;
             applyPolicySettings();
+            if (p.lockdown != wasLocked) applyLockdown(p.lockdown, true);
             loadHome();
             dismissToolbar();
             managed.setApplied(p.version);
@@ -1069,7 +1075,7 @@ public class MainActivity extends Activity {
     }
 
     private boolean lockdownWanted() {
-        return Lockdown.wanted(this);
+        return policy != null ? policy.lockdown : Lockdown.localSetting(this);
     }
 
     private ComponentName admin() {
@@ -1092,6 +1098,10 @@ public class MainActivity extends Activity {
 
     /** The toolbar's Lockdown button. */
     private void lockdownTapped() {
+        if (policy != null) { // managed: set by the server, so only the checklist
+            showLockdownChecklist();
+            return;
+        }
         if (!lockdownWanted()) {
             setLockdown(true);
             if (Lockdown.fullLockPossible(this)) {
@@ -1105,11 +1115,18 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** The local toggle (unmanaged tablets only). */
     private void setLockdown(boolean on) {
-        SharedPreferences.Editor ed = getSharedPreferences(PREFS, 0).edit();
-        ed.putBoolean(KEY_LOCKDOWN, on);
-        ed.apply();
-        managed.addEvent(on ? "lockdown_on" : "lockdown_off", Json.obj("mode", Lockdown.mode(this)));
+        Lockdown.setLocalSetting(this, on);
+        applyLockdown(on, false);
+        if (!on) toast("Lockdown is off. The system menus and buttons work again");
+    }
+
+    /** Turns lockdown on or off. {@code fromPolicy}: the Shepherd policy changed it. */
+    private void applyLockdown(boolean on, boolean fromPolicy) {
+        JSONObject data = Json.obj("mode", Lockdown.mode(this));
+        if (fromPolicy) Json.put(data, "source", "policy");
+        managed.addEvent(on ? "lockdown_on" : "lockdown_off", data);
         Lockdown.setHome(this, on);
         if (on) {
             handler.post(enforceLockdown);
@@ -1117,7 +1134,6 @@ public class MainActivity extends Activity {
             handler.removeCallbacks(returnToKiosky);
             statusBarBlocker.hide(this);
             stopLock();
-            toast("Lockdown is off. The system menus and buttons work again");
         }
         refreshToolbar();
     }
@@ -1129,17 +1145,22 @@ public class MainActivity extends Activity {
     private void showLockdownChecklist() {
         final boolean on = lockdownWanted();
         String mode = Lockdown.mode(this);
+        final boolean local = policy == null; // managed tablets follow the server
         if (!"partial".equals(mode)) {
-            dialog().setTitle("owner".equals(mode) ? "Full lockdown (device owner)" : "Full lockdown (MDM)")
+            AlertDialog.Builder b = dialog()
+                    .setTitle("owner".equals(mode) ? "Full lockdown (device owner)" : "Full lockdown (MDM)")
                     .setMessage("The notification shade, Home, Recents and the power menu are blocked. "
-                            + "Kiosky's menu is the only way out.")
-                    .setPositiveButton(on ? "Turn off lockdown" : "Turn on lockdown", new DialogInterface.OnClickListener() {
-                        public void onClick(DialogInterface d, int w) {
-                            setLockdown(!on);
-                        }
-                    })
-                    .setNegativeButton("Close", null)
-                    .show();
+                            + "Kiosky's menu is the only way out."
+                            + (local ? "" : "\n\nLockdown is set by " + policy.organisation + "."))
+                    .setNegativeButton("Close", null);
+            if (local) {
+                b.setPositiveButton(on ? "Turn off lockdown" : "Turn on lockdown", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) {
+                        setLockdown(!on);
+                    }
+                });
+            }
+            b.show();
             return;
         }
 
@@ -1199,23 +1220,27 @@ public class MainActivity extends Activity {
             }
         });
 
-        dialog().setTitle(on ? "Lockdown is on (partial)" : "Lockdown")
+        AlertDialog.Builder b = dialog()
+                .setTitle(local ? (on ? "Lockdown is on (partial)" : "Lockdown")
+                        : "Partial lockdown, set by " + policy.organisation)
                 .setItems(labels.toArray(new CharSequence[0]), new DialogInterface.OnClickListener() {
                     public void onClick(DialogInterface d, int which) {
                         actions.get(which).run();
-                    }
-                })
-                .setPositiveButton(on ? "Turn off lockdown" : "Turn on lockdown", new DialogInterface.OnClickListener() {
-                    public void onClick(DialogInterface d, int w) {
-                        setLockdown(!on);
                     }
                 })
                 .setNegativeButton("Close", new DialogInterface.OnClickListener() {
                     public void onClick(DialogInterface d, int w) {
                         if (lockdownWanted()) dismissToolbar();
                     }
-                })
-                .show();
+                });
+        if (local) {
+            b.setPositiveButton(on ? "Turn off lockdown" : "Turn on lockdown", new DialogInterface.OnClickListener() {
+                public void onClick(DialogInterface d, int w) {
+                    setLockdown(!on);
+                }
+            });
+        }
+        b.show();
     }
 
     // ======================================================================
