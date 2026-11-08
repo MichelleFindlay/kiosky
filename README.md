@@ -1,3 +1,5 @@
+<p align="center"><img src="app/assets/logo.png" alt="Kiosky logo" width="128" height="128"></p>
+
 # kiosky
 
 A full-screen Android web kiosk for wall-mounted tablets. Usage instructions live in [app/assets/help.md](app/assets/help.md); the app shows that page on first launch, before an address has been set.
