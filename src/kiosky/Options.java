@@ -19,14 +19,24 @@ import java.util.Calendar;
  *   "off_at": "", "on_at": "",     // screen off between these local times (HH:MM)
  *   "wake_on_touch": true, "wake_on_motion": false, "wake_minutes": 5,
  *   "dim_at": "", "dim_until": "", "dim_brightness": 15,
- *   "idle_dim_minutes": 0          // dim after this long untouched (0: never)
+ *   "idle_dim_minutes": 0,         // dim after this long untouched (0: never)
+ *   "pixel_shift": false           // move the page a pixel or two now and then, against burn-in
  * },
+ * "touch": { "zoom": false, "long_press": true, "text_selection": true },
+ * "offline": { "last_page": true }, // the last good page, greyed out, behind "Reconnecting…"
+ * "input": { "nfc": false, "barcode": true },  // scans sent to the page and MQTT (ScanInput)
  * "battery": { "protect": false }, // the tablet's own charging limit, where there is one (Battery)
  * "playlist": { "urls": [], "seconds": 60, "pause_on_touch_seconds": 120 },
  * "screensaver": { "minutes": 0, "url": "" },   // clock (or a page) after this long untouched
  * "audio": { "volume": -1, "quiet_at": "", "quiet_until": "", "quiet_volume": 0 },
  * "file_uploads": true,
- * "reboot_at": ""                  // daily restart (a full reboot when Kiosky is device owner)
+ * "reboot_at": "",                 // daily restart (a full reboot when Kiosky is device owner)
+ * "session": { "clear_on_idle": false },  // forget sign-ins and page data at idle_home_minutes
+ * "mqtt": {                        // local control, e.g. from Home Assistant (Mqtt)
+ *   "host": "", "port": 1883, "tls": false, "fingerprint": "",
+ *   "username": "", "password": "", "topic": "", "name": "",
+ *   "discovery": true, "discovery_prefix": "homeassistant"
+ * }
  * </pre>
  */
 final class Options {
@@ -48,6 +58,14 @@ final class Options {
     final int dimBrightness;        // percent
     final int idleDimMinutes;
     final boolean batteryProtect;
+    final boolean pixelShift;
+
+    final boolean zoom;             // pinch to zoom
+    final boolean longPress;        // long presses: text selection and its menu, link previews
+    final boolean textSelection;    // selecting text on the page (form fields always allow it)
+    final boolean offlineLastPage;
+    final boolean nfc;              // read NFC tags while Kiosky is in front
+    final boolean barcode;          // spot keyboard-style barcode scanners
 
     final String[] playlistUrls;
     final int playlistSeconds;
@@ -59,6 +77,17 @@ final class Options {
     final int quietVolume;          // percent during quiet hours
     final boolean fileUploads;
     final int rebootAt;             // minutes after midnight; -1: never
+    final boolean clearSessionOnIdle;
+
+    final String mqttHost;          // "": MQTT off
+    final int mqttPort;
+    final boolean mqttTls;
+    final String mqttFingerprint;   // normalised SHA-256 hex of a self-signed broker certificate, or ""
+    final String mqttUsername, mqttPassword;
+    final String mqttTopic;         // "": kiosky/<device>
+    final String mqttName;          // "": the device name or model
+    final boolean mqttDiscovery;
+    final String mqttDiscoveryPrefix;
 
     Options(JSONObject o) {
         if (o == null) o = new JSONObject();
@@ -84,6 +113,16 @@ final class Options {
         dimUntil = dims ? dimTo : -1;
         dimBrightness = Json.clamp(s == null ? 15 : s.optInt("dim_brightness", 15), 1, 100);
         idleDimMinutes = Json.clamp(s == null ? 0 : s.optInt("idle_dim_minutes", 0), 0, 1440);
+        pixelShift = s != null && s.optBoolean("pixel_shift", false);
+        JSONObject touch = o.optJSONObject("touch");
+        zoom = touch != null && touch.optBoolean("zoom", false);
+        longPress = touch == null || touch.optBoolean("long_press", true);
+        textSelection = touch == null || touch.optBoolean("text_selection", true);
+        JSONObject offline = o.optJSONObject("offline");
+        offlineLastPage = offline == null || offline.optBoolean("last_page", true);
+        JSONObject input = o.optJSONObject("input");
+        nfc = input != null && input.optBoolean("nfc", false);
+        barcode = input == null || input.optBoolean("barcode", true);
         JSONObject battery = o.optJSONObject("battery");
         batteryProtect = battery != null && battery.optBoolean("protect", false);
 
@@ -114,6 +153,33 @@ final class Options {
 
         fileUploads = o.optBoolean("file_uploads", true);
         rebootAt = time(Json.str(o, "reboot_at", ""));
+        JSONObject session = o.optJSONObject("session");
+        clearSessionOnIdle = session != null && session.optBoolean("clear_on_idle", false);
+
+        JSONObject mq = o.optJSONObject("mqtt");
+        mqttHost = Json.str(mq, "host", "").trim();
+        mqttTls = mq != null && mq.optBoolean("tls", false);
+        mqttPort = Json.clamp(mq == null ? 1883 : mq.optInt("port", mqttTls ? 8883 : 1883), 1, 65535);
+        String fp = Trust.normalise(Json.str(mq, "fingerprint", ""));
+        mqttFingerprint = fp.length() == 64 ? fp : "";
+        mqttUsername = Json.str(mq, "username", "");
+        mqttPassword = Json.str(mq, "password", "");
+        mqttTopic = Mqtt.cleanTopic(Json.str(mq, "topic", ""));
+        mqttName = Json.str(mq, "name", "").trim();
+        mqttDiscovery = mq == null || mq.optBoolean("discovery", true);
+        String prefix = Mqtt.cleanTopic(Json.str(mq, "discovery_prefix", ""));
+        mqttDiscoveryPrefix = prefix.length() > 0 ? prefix : "homeassistant";
+    }
+
+    boolean mqttEnabled() {
+        return mqttHost.length() > 0;
+    }
+
+    /** Everything a running MQTT connection depends on, to tell when it must reconnect. */
+    String mqttKey() {
+        return mqttHost + "|" + mqttPort + "|" + mqttTls + "|" + mqttFingerprint + "|" + mqttUsername + "|"
+                + mqttPassword + "|" + mqttTopic + "|" + mqttName + "|" + mqttDiscovery + "|" + mqttDiscoveryPrefix
+                + "|" + nfc + "|" + barcode; // which scanner entities discovery describes
     }
 
     /** The volume wanted right now, in percent, or -1 to leave it alone. */
@@ -144,7 +210,10 @@ final class Options {
                         "wake_minutes", wakeMinutes,
                         "dim_at", format(dimAt), "dim_until", format(dimUntil),
                         "dim_brightness", dimBrightness,
-                        "idle_dim_minutes", idleDimMinutes),
+                        "idle_dim_minutes", idleDimMinutes, "pixel_shift", pixelShift),
+                "touch", Json.obj("zoom", zoom, "long_press", longPress, "text_selection", textSelection),
+                "offline", Json.obj("last_page", offlineLastPage),
+                "input", Json.obj("nfc", nfc, "barcode", barcode),
                 "battery", Json.obj("protect", batteryProtect),
                 "playlist", Json.obj("urls", array(playlistUrls),
                         "seconds", playlistSeconds, "pause_on_touch_seconds", playlistPauseSeconds),
@@ -152,7 +221,12 @@ final class Options {
                 "audio", Json.obj("volume", volume, "quiet_at", format(quietAt), "quiet_until", format(quietUntil),
                         "quiet_volume", quietVolume),
                 "file_uploads", fileUploads,
-                "reboot_at", format(rebootAt));
+                "reboot_at", format(rebootAt),
+                "session", Json.obj("clear_on_idle", clearSessionOnIdle),
+                "mqtt", Json.obj("host", mqttHost, "port", mqttPort, "tls", mqttTls,
+                        "fingerprint", mqttFingerprint, "username", mqttUsername, "password", mqttPassword,
+                        "topic", mqttTopic, "name", mqttName, "discovery", mqttDiscovery,
+                        "discovery_prefix", mqttDiscoveryPrefix));
     }
 
     private static org.json.JSONArray array(String[] values) {

@@ -80,6 +80,31 @@ it again without pressing anything.
   it, and if that doesn't help, starts it again from scratch. On by default (2
   minutes).
 - **Pages may use the camera / microphone**: see *Camera and microphone*.
+- **Shared tablet**: for a tablet the public uses, such as a visitor check-in.
+  When Kiosky goes back to the start page after the minutes above, it also signs
+  out of everything: cookies, saved site data, the cache and history. It only does
+  this if someone touched the tablet since the last time. Don't tick it for a
+  dashboard you sign in to once, or it will sign you out too.
+
+### Touch
+
+- **Pinch to zoom**: off by default, so a stray two-finger touch can't leave the
+  dashboard zoomed in. Turn it on if people need to enlarge the page.
+- **Long press**: untick it so pressing and holding does nothing: no text
+  selection with its Copy/Share/Search menu (which can lead to other apps), and no
+  link previews. Text boxes lose their paste menu too.
+- **Selecting the page's text**: untick it so a double tap or long press can't
+  highlight the page's text. Text boxes still work.
+
+### Scanners
+
+- **Read NFC tags**: while Kiosky is in front, a tag held to the tablet is read and
+  sent to the page (see *Controlling the tablet from a dashboard*) and to Home
+  Assistant. It also stops tags opening other apps. NFC must be on in Android's
+  settings.
+- **Barcode scanners**: USB and Bluetooth scanners type like a very fast
+  keyboard. Kiosky spots that and sends each scan to the page and to Home
+  Assistant as well; the scan still types into a focused text box as before.
 
 ### Playlist
 
@@ -110,6 +135,14 @@ still turn it up or down by hand until the next change.
   picker. Turn it off on public tablets that don't need it.
 - **Forget saved sign-ins and trusted certificates**: see *Sign-ins and
   certificates*.
+- **Move the page a pixel or two every few minutes**: shifts everything slowly
+  around a tiny circle (at most 2 pixels), so a dashboard shown all day doesn't
+  burn into cheaper LCD and OLED screens. Nobody notices it.
+- **While reconnecting, show the last page greyed out**: see *Good to know*.
+
+### Home Assistant (MQTT)
+
+See *Home Assistant and MQTT* below.
 
 ### Settings PIN
 
@@ -150,10 +183,86 @@ automation on a Home Assistant dashboard:
 | `kiosky.setBrightness(30)` | Sets the brightness in percent; `0` goes back to the tablet's own |
 | `kiosky.screenOff()` | Blacks the screen out until the next touch or `wake()` |
 | `kiosky.deviceName()` | The tablet's name in Shepherd |
+| `kiosky.speak("Hello")` | Reads the text aloud |
+| `kiosky.battery()` | JSON text: `{"level": 80, "charging": true, "temperature": 31.5}` |
+| `kiosky.setUrl("https://…")` | Opens a page until Kiosky goes back to the start page |
+| `kiosky.watchMotion(true)` | Sends `kiosky:motion` events (below) until the page changes; `false` without a sensor |
+| `kiosky.nfcAvailable()` | `true` while NFC tags are being read |
 
 Everything below `version()` only works for your own page's site (on a managed
 tablet: the start page's site and the allowed sites), and returns `false` (or an
 empty name) anywhere else.
+
+Kiosky also sends your own page events, so it can react without checking
+repeatedly:
+
+```
+window.addEventListener('kiosky:motion', (e) => console.log(e.detail.source)); // "proximity" or "light"
+window.addEventListener('kiosky:nfc', (e) => console.log(e.detail.id, e.detail.records));
+window.addEventListener('kiosky:barcode', (e) => console.log(e.detail.code));
+```
+
+An NFC tag gives its `id` (hex), `techs`, and `records`: each with `text`, `uri`,
+or `mime` and `data` (base64). Scans also wake the screen.
+
+## Home Assistant and MQTT
+
+Kiosky can connect to an MQTT broker (such as the Mosquitto add-on in Home
+Assistant), so your home server can see the tablet and control it. In
+**Settings › Home Assistant (MQTT)**, enter the broker's address, and the
+username and password if it needs them. The line above the fields shows
+whether Kiosky is connected.
+
+With **Add it to Home Assistant automatically** ticked, the tablet shows up in
+Home Assistant as a device (Settings › Devices › MQTT) with:
+
+| Entity | What it does |
+| --- | --- |
+| **Screen** | Switch: off blacks the screen out until a touch; on wakes it |
+| **Brightness** | 1–100% |
+| **Volume** | Media volume, 0–100% |
+| **Page** | Shows the address on screen; set it to open another page |
+| **Reload**, **Start page** | Buttons |
+| **Announce** | Reads a message aloud (`notify.send_message`) |
+| **Motion** | On when someone touches the tablet or the proximity or light sensor notices someone, off 30 seconds later |
+| **Battery**, **Charging**, **Battery temperature**, **Wi-Fi signal**, **Page title** | Sensors |
+| **NFC tag**, **Barcode** | Events, when those scanners are on: trigger automations from a scan |
+
+A page opened from Home Assistant stays until Kiosky goes back to the start page
+(after the minutes set in *Page*, or with **Start page**).
+
+**Without discovery**, use the topics directly. The base topic is
+`kiosky/` followed by part of the tablet's ID (shown in Settings), or your own
+**Topic**:
+
+| Topic | Payload |
+| --- | --- |
+| `<base>/availability` | `online` or `offline` (Kiosky publishes) |
+| `<base>/state` | JSON: `screen` (`on`, `dim`, `off`), `brightness`, `volume`, `url`, `title`, `battery_level`, `charging`, `battery_temperature`, `wifi_rssi`, `screensaver`, `offline`, `app_version` |
+| `<base>/motion` | `ON` or `OFF` |
+| `<base>/cmd/wake` | Optional minutes to stay awake |
+| `<base>/cmd/screen` | `ON` or `OFF` |
+| `<base>/cmd/screen_off` | Anything |
+| `<base>/cmd/brightness`, `<base>/cmd/volume` | A percentage |
+| `<base>/cmd/set_url` | An `https://` (or `http://`) address |
+| `<base>/cmd/go_home`, `<base>/cmd/reload` | Anything |
+| `<base>/cmd/announce` | Text, or `{"text": "…", "volume": 80}` |
+| `<base>/cmd/clear_session` | Anything: signs out of everything, as for a shared tablet |
+| `<base>/nfc`, `<base>/barcode` | Scans (Kiosky publishes): JSON with `event_type: "scanned"` and the details above |
+
+For example, to wake the screen when the doorbell rings:
+
+```
+action: mqtt.publish
+data:
+  topic: kiosky/1a2b3c4d/cmd/wake
+  payload: "5"
+```
+
+**Security.** Anyone who can publish to the broker can control the tablet, so
+give the broker a password. **Use TLS** encrypts the connection (usually port
+8883). For a broker with a self-signed certificate, enter its SHA-256
+**certificate fingerprint**; Kiosky then trusts exactly that certificate.
 
 ## Sign-ins and certificates
 
@@ -209,6 +318,13 @@ logins and settings are kept through updates.
 Updates come from the project's releases on GitHub. Android only installs an
 update signed with the same key as the copy you already have, so a tampered file
 is refused.
+
+**If an update goes wrong.** For 15 minutes after a new version first starts,
+Kiosky watches for crashes. If it crashes twice in that time, it starts in *safe
+mode*: MQTT, the motion sensors and Wi-Fi changes are switched off and it doesn't
+reopen the last page, so it keeps running and can receive the next update. On a
+managed tablet, it also tells the server. Android never lets an app go back to an
+older version by itself, so the fix is always a newer one.
 
 ## Start automatically
 
@@ -340,6 +456,9 @@ already managed ignores enrollment links and codes.
   administrator allows by name.
 - Kiosky reports the page it's showing, any loading errors, battery, Wi-Fi
   signal and whether start-on-boot and update permissions are granted.
+- The server can save Wi-Fi networks on the tablet (as device owner, on Android
+  10 and later), so a new router or password doesn't need a visit. A changed
+  password that doesn't connect within 10 minutes is put back as it was.
 
 If the tablet loses contact with the server, it keeps its last settings and
 stays locked. It's released only when the administrator removes it in Shepherd.
@@ -355,12 +474,14 @@ missing permissions. After five wrong PINs, PIN entry is locked for 5 minutes.
 ## Good to know
 
 - **Logins are kept.** Cookies and site storage are saved, so you stay signed
-  in after restarting the app or the tablet.
+  in after restarting the app or the tablet (unless **Shared tablet** is ticked
+  in Settings).
 - **Lost connection?** If the page can't be reached (Wi-Fi waking up, server
-  restarting), Kiosky shows a *Reconnecting…* screen with the time and tries
-  again every 10 seconds on its own. That includes servers answering with an error
-  while they start, like Home Assistant's *502 Bad Gateway*. Tap **Try now** to
-  retry straight away.
+  restarting), Kiosky shows the last good picture of the page, greyed out, with a
+  *Reconnecting…* banner (or a full *Reconnecting…* screen if it has no picture of
+  that site yet), and tries again every 10 seconds on its own. That includes
+  servers answering with an error while they start, like Home Assistant's *502 Bad
+  Gateway*. Tap **Try now** to retry straight away.
 - **Page crashed?** If the page's renderer crashes or Android stops it to free
   memory, Kiosky starts it again on its own instead of closing.
 - **Pop-ups close themselves.** A page's `alert()`, `confirm()` or `prompt()` box

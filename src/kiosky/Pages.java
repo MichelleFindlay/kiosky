@@ -5,6 +5,7 @@ import android.content.Context;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.util.Locale;
 
 /** The built-in pages: help (from app/assets/help.md) and the managed "waiting" screen. */
 final class Pages {
@@ -18,13 +19,43 @@ final class Pages {
     static String help(Context c, boolean start) {
         String body;
         try {
-            body = Markdown.toHtml(readAsset(c, "help.md").replace("{{version}}", Updater.currentVersion(c)));
+            body = Markdown.toHtml(readAsset(c, helpAsset(c)).replace("{{version}}", Updater.currentVersion(c)));
         } catch (IOException e) {
             body = "<h1>Kiosky</h1><p>The help page couldn't be loaded. Swipe in from the top "
                     + "or bottom edge to open the toolbar and enter an address.</p>";
         }
         return page("Kiosky help", start ? HELP_ARROW + "<main>" + body + "</main>"
                 : "<main class=\"plain\">" + body + "</main>");
+    }
+
+    /**
+     * help.&lt;language&gt;.md for the tablet's language (help.de.md for German), or the
+     * English help.md when there's no translation. Translations keep the app's own
+     * button names in English, as they appear on screen.
+     */
+    static String helpAsset(Context c) {
+        String lang = helpLanguage(Locale.getDefault().getLanguage());
+        if (lang.length() > 0) {
+            try {
+                String[] files = c.getAssets().list("");
+                for (int i = 0; files != null && i < files.length; i++) {
+                    if (("help." + lang + ".md").equals(files[i])) return files[i];
+                }
+            } catch (IOException ignored) {
+                // English, then
+            }
+        }
+        return "help.md";
+    }
+
+    /** "de" from "de"; Java's old codes for Hebrew, Indonesian and Yiddish mapped to the current ones; "" for English. */
+    static String helpLanguage(String lang) {
+        if (lang == null) return "";
+        lang = lang.toLowerCase(Locale.ROOT);
+        if ("iw".equals(lang)) lang = "he";
+        if ("in".equals(lang)) lang = "id";
+        if ("ji".equals(lang)) lang = "yi";
+        return "en".equals(lang) || !lang.matches("[a-z]{2,3}") ? "" : lang;
     }
 
     /** Shown on a managed tablet whose policy has no start page yet. */

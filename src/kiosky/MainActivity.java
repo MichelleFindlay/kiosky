@@ -12,6 +12,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.net.Uri;
 import android.os.Build;
@@ -172,6 +173,31 @@ public class MainActivity extends Activity {
     private boolean landingHome, clearHistoryOnLoad;
     private long landingUntil;
     private String homeLanded;        // where the start page actually ended up (redirects, SPA routes)
+    private boolean touchedSinceClear = true; // session.clear_on_idle: someone used it since the last wipe
+    private boolean safeMode;         // this version crashed right after updating (UpdateHealth)
+    private boolean forceUpdateCheck; // check_update: install a GitHub release without waiting for its turn
+
+    // Local control over MQTT (Home Assistant)
+    private Mqtt mqtt;
+    private String mqttKey;           // the settings the running connection uses
+    private String mqttLastState;
+    private boolean motionOn;
+
+    // Scanners, page events, the offline picture and burn-in protection
+    private ScanInput scanInput;
+    private boolean pageWantsMotion;  // window.kiosky.watchMotion(true) on the page now showing
+    private long lastMotionEvent;
+    private Bitmap snapshot;          // the last page that loaded properly, for the offline screen
+    private String snapshotHost;
+    private int snapshotOrientation;
+    private boolean snapshotLoaded;
+    private long snapshotAt;
+    private boolean pageLoading = true; // from onPageStarted until it finishes properly
+    private int shiftStep;
+    private long lastShiftAt;
+    private static final String SNAPSHOT_FILE = "last_page.jpg";
+    /** Burn-in protection: a slow circle, at most 2 pixels from where the page belongs. */
+    private static final int[][] SHIFT = {{0, 0}, {1, 1}, {2, 0}, {1, -1}, {0, -2}, {-1, -1}, {-2, 0}, {-1, 1}};
 
     // Camera and microphone, while Android's permission prompt is open
     private PermissionRequest pendingMedia;
@@ -210,7 +236,11 @@ public class MainActivity extends Activity {
             checkIdleHome();
             watchdog();
             if (offline.showing()) offline.tick();
-            if (ticks++ % 4 == 0) checkBattery(); // once a minute
+            if (ticks % 4 == 0) checkBattery(); // once a minute
+            if (ticks++ % 4 == 2) checkHealthAndWifi();
+            publishMqttState();
+            pixelShift();
+            if (SystemClock.elapsedRealtime() - snapshotAt > 10 * MINUTE_MS) captureSnapshot(); // dashboards change
             saver.tick();
             applyVolume();
             checkReboot();
@@ -243,6 +273,25 @@ public class MainActivity extends Activity {
             } catch (Exception e) {
                 managed.addEvent("reboot_failed", Json.obj("message", String.valueOf(e)));
             }
+        }
+    };
+
+    private final Runnable motionOff = new Runnable() {
+        public void run() {
+            motionOn = false;
+            if (mqtt != null) mqtt.publish("motion", "OFF", true);
+        }
+    };
+
+    private final Runnable takeSnapshot = new Runnable() {
+        public void run() {
+            captureSnapshot();
+        }
+    };
+
+    private final Runnable mqttRefresh = new Runnable() {
+        public void run() {
+            publishMqttState();
         }
     };
 
@@ -309,6 +358,8 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         Crashes.install(this);
+        UpdateHealth.started(this);
+        safeMode = UpdateHealth.safeMode(this);
         managed = new ManagedState(this);
         JSONObject crash = Crashes.takePending(this);
         if (crash != null) managed.addEvent("crash", crash);
@@ -319,9 +370,20 @@ public class MainActivity extends Activity {
         motion = new MotionWake(this, new MotionWake.Listener() {
             public void onMotion(String source) {
                 if (options().wakeOnMotion) wakeScreen(options().wakeMinutes);
+                motionSeen();
+                long now = SystemClock.elapsedRealtime();
+                if (pageWantsMotion && now - lastMotionEvent > 1000) {
+                    lastMotionEvent = now;
+                    pageEvent("motion", Json.obj("source", source));
+                }
             }
         });
 
+        scanInput = new ScanInput(this, new ScanInput.Listener() {
+            public void onScan(String type, JSONObject scan) {
+                scanned(type, scan);
+            }
+        });
         root = new FrameLayout(this);
         buildWebView();
         offline = new OfflineScreen(this, new Runnable() {
@@ -338,7 +400,21 @@ public class MainActivity extends Activity {
         setContentView(root);
 
         updater = new Updater(this, new Updater.Listener() {
-            public void onUpdateAvailable(String version, String apkUrl, long size) {
+            public void onUpdateAvailable(String version, String apkUrl, long size, long publishedAt, boolean manual) {
+                boolean force = manual || forceUpdateCheck;
+                forceUpdateCheck = false;
+                if (!force && policy != null && policy.autoInstall && policy.rolloutHours > 0 && publishedAt > 0) {
+                    // Staged rollout: this tablet's turn comes a set time after the release
+                    long wait = publishedAt + Updater.rolloutDelayMs(MainActivity.this, policy.rolloutHours)
+                            - System.currentTimeMillis();
+                    if (wait > 0) {
+                        if (wait < policy.checkHours * HOUR_MS) {
+                            handler.removeCallbacks(autoCheck);
+                            handler.postDelayed(autoCheck, wait + MINUTE_MS);
+                        }
+                        return;
+                    }
+                }
                 offerUpdate(version, 0, apkUrl, size, null, null);
             }
 
@@ -366,7 +442,7 @@ public class MainActivity extends Activity {
 
         applyPolicySettings();
 
-        if (state != null && !freshStart) {
+        if (state != null && !freshStart && !safeMode) {
             web.restoreState(state);
         } else {
             loadHome();
@@ -376,9 +452,11 @@ public class MainActivity extends Activity {
         freshStart = false;
 
         if (policy != null) {
-            managed.addEvent("app_started", null);
+            managed.addEvent("app_started", safeMode ? Json.obj("safe_mode", true) : null);
             // The cached policy was applied above; report it as applied
             if (policy.version.length() > 0) managed.setApplied(policy.version);
+            JSONObject health = UpdateHealth.check(this); // in the first check-in, in case it crashes again soon
+            if (health != null) managed.addEvent(Json.str(health, "type", ""), health.optJSONObject("data"));
             shepherd.start();
         }
     }
@@ -415,6 +493,7 @@ public class MainActivity extends Activity {
         if (web != null) web.onResume();
         handler.post(enforceLockdown); // once the activity is fully in front
         heartbeatPending = false; // time spent paused isn't a frozen page
+        scanInput.setNfc(options().nfc && !safeMode);
         tick.run();
     }
 
@@ -424,6 +503,7 @@ public class MainActivity extends Activity {
         setStatusBarBlocked(false); // Settings or an install prompt may need it
         statusBarBlocker.hide(this);
         motion.stop();
+        scanInput.setNfc(false);
         if (web != null) web.onPause();
         CookieManager.getInstance().flush();
         super.onPause();
@@ -471,6 +551,13 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** Keyboard-style barcode scanners type a burst of keys; the keys still reach the page. */
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent e) {
+        if (options().barcode && !safeMode) scanInput.key(e);
+        return super.dispatchKeyEvent(e);
+    }
+
     /**
      * Every touch: counts as activity for idle dimming and going home, and wakes the
      * screen. A touch that wakes a dimmed or switched-off screen doesn't reach the page.
@@ -483,6 +570,8 @@ public class MainActivity extends Activity {
             boolean asleep = screenState == Options.OFF || idleDimmed || saver.showing();
             lastTouch = lastActivity = now;
             manualOff = false;
+            touchedSinceClear = true;
+            motionSeen();
             Options o = options();
             if (scheduledOff && o.wakeOnTouch) wakeUntil = now + o.wakeMinutes * MINUTE_MS;
             if (screenState == Options.OFF && !o.wakeOnTouch) {
@@ -533,6 +622,11 @@ public class MainActivity extends Activity {
         handler.removeCallbacks(liveFrame);
         handler.removeCallbacks(pendingEnroll);
         handler.removeCallbacks(rebootNow);
+        handler.removeCallbacks(motionOff);
+        handler.removeCallbacks(mqttRefresh);
+        handler.removeCallbacks(takeSnapshot);
+        if (mqtt != null) mqtt.stop();
+        mqtt = null;
         motion.stop();
         closeHelp();
         saver.hide();
@@ -644,6 +738,9 @@ public class MainActivity extends Activity {
                 boolean sameLoad = url != null && url.equals(errorUrl)
                         && SystemClock.elapsedRealtime() - errorAt < 2000;
                 if (!sameLoad) errorThisLoad = false;
+                pageWantsMotion = false; // each page asks for itself
+                pageLoading = true;
+                handler.removeCallbacks(takeSnapshot);
                 if (!allowed(url)) { // catches redirects that skip shouldOverrideUrlLoading
                     view.stopLoading();
                     blocked(url);
@@ -658,7 +755,11 @@ public class MainActivity extends Activity {
                     clearHistoryOnLoad = false;
                     view.clearHistory();
                 }
+                applyTouchCss();
                 if (errorThisLoad) return;
+                pageLoading = false;
+                handler.removeCallbacks(takeSnapshot);
+                handler.postDelayed(takeSnapshot, 8000); // once a dashboard has drawn itself
                 pageUrl = url;
                 handler.removeCallbacks(retry);
                 offline.hide();
@@ -744,7 +845,7 @@ public class MainActivity extends Activity {
             return;
         }
         int seconds = retrySeconds();
-        offline.show(Policy.host(url), problem, seconds);
+        offline.show(Policy.host(url), problem, seconds, snapshotFor(url));
         handler.removeCallbacks(retry);
         handler.postDelayed(retry, seconds * 1000L);
     }
@@ -861,6 +962,64 @@ public class MainActivity extends Activity {
                 }
             });
             return true;
+        }
+
+        /** Reads the text aloud with the tablet's text-to-speech. */
+        @JavascriptInterface
+        public boolean speak(final String text) {
+            if (!a.trustedPage() || text == null || text.trim().length() == 0) return false;
+            a.handler.post(new Runnable() {
+                public void run() {
+                    if (a.speaker == null) a.speaker = new Speaker(a);
+                    a.speaker.say(text.trim(), -1);
+                }
+            });
+            return true;
+        }
+
+        /** JSON: {level, charging, temperature}, or null. */
+        @JavascriptInterface
+        public String battery() {
+            if (!a.trustedPage()) return null;
+            android.content.Intent b = Battery.read(a);
+            if (b == null) return null;
+            float t = Battery.temperature(b);
+            return Json.obj("level", Battery.level(b), "charging", Battery.charging(b),
+                    "temperature", Float.isNaN(t) ? null : Double.valueOf(Math.round(t * 10) / 10.0)).toString();
+        }
+
+        /** Opens an address until the tablet goes back to its start page (managed: allowed sites only). */
+        @JavascriptInterface
+        public boolean setUrl(final String url) {
+            if (!a.trustedPage() || url == null || !(url.startsWith("https://") || url.startsWith("http://"))) return false;
+            a.handler.post(new Runnable() {
+                public void run() {
+                    a.openTemporary(url);
+                }
+            });
+            return true;
+        }
+
+        /**
+         * Sends "kiosky:motion" events to this page when the proximity or light sensor
+         * notices someone, until it navigates away. Returns false without a sensor.
+         */
+        @JavascriptInterface
+        public boolean watchMotion(final boolean on) {
+            if (!a.trustedPage() || !a.motion.available()) return false;
+            a.handler.post(new Runnable() {
+                public void run() {
+                    a.pageWantsMotion = on;
+                    a.updateScreen();
+                }
+            });
+            return true;
+        }
+
+        /** Whether NFC tags are being read (setting on, and NFC switched on in Android). */
+        @JavascriptInterface
+        public boolean nfcAvailable() {
+            return a.options().nfc && a.scanInput.nfcOn();
         }
 
         /** The name given in Shepherd, or "" when unmanaged or untrusted. */
@@ -1506,6 +1665,9 @@ public class MainActivity extends Activity {
         appliedVolume = -2;
         applyVolume();
         schedulePlaylist();
+        applyMqtt();
+        applyWifi();
+        if (resumed) scanInput.setNfc(options().nfc && !safeMode);
     }
 
     /** The WebView's own settings; re-applied when the WebView is rebuilt. */
@@ -1517,6 +1679,31 @@ public class MainActivity extends Activity {
                 ? defaultUserAgent + " " + p.userAgentSuffix : defaultUserAgent);
         s.setMediaPlaybackRequiresUserGesture(p != null && !p.autoplayMedia);
         CookieManager.getInstance().setAcceptThirdPartyCookies(web, p == null || p.thirdPartyCookies);
+        Options o = options();
+        s.setSupportZoom(o.zoom);
+        s.setBuiltInZoomControls(o.zoom); // pinch to zoom
+        s.setDisplayZoomControls(false);  // never the +/- buttons
+        web.setOnLongClickListener(o.longPress ? null : new View.OnLongClickListener() {
+            public boolean onLongClick(View v) {
+                return true; // handled: no text selection, its Copy/Share/Search menu or link previews
+            }
+        });
+        web.setLongClickable(o.longPress);
+        web.setHapticFeedbackEnabled(o.longPress);
+        applyTouchCss();
+    }
+
+    /** touch.text_selection off: the page's own text can't be selected; form fields still can. */
+    private void applyTouchCss() {
+        if (web == null) return;
+        String url = web.getUrl();
+        if (url == null || isInternal(url)) return;
+        boolean block = !options().textSelection;
+        web.evaluateJavascript("(function(){var s=document.getElementById('kiosky-touch');"
+                + "if(!" + block + "){if(s)s.remove();return;}"
+                + "if(!s){s=document.createElement('style');s.id='kiosky-touch';(document.head||document.documentElement).appendChild(s);}"
+                + "s.textContent='*:not(input):not(textarea):not([contenteditable]):not([contenteditable] *)"
+                + "{-webkit-user-select:none!important;user-select:none!important;-webkit-touch-callout:none!important}';})()", null);
     }
 
     private Options options() {
@@ -1555,6 +1742,11 @@ public class MainActivity extends Activity {
             Json.put(s, "reboot_supported", canReboot());
             Json.put(s, "volume_percent", volumePercent());
             if (options().playlistUrls.length > 0) Json.put(s, "playlist_index", playlistIndex);
+            Json.put(s, "mqtt", mqtt == null ? "off" : mqtt.status);
+            Json.put(s, "wifi_config", Wifi.status(MainActivity.this));
+            String health = UpdateHealth.state(MainActivity.this);
+            if (health != null) Json.put(s, "update_health", health);
+            Json.put(s, "safe_mode", safeMode);
             return s;
         }
 
@@ -1677,15 +1869,13 @@ public class MainActivity extends Activity {
             web.clearCache(true);
             web.reload();
         } else if ("clear_web_data".equals(type)) {
-            CookieManager.getInstance().removeAllCookies(null);
-            CookieManager.getInstance().flush();
-            WebStorage.getInstance().deleteAllData();
-            web.clearCache(true);
-            web.clearHistory();
-            loadHome();
+            clearWebData();
         } else if ("check_update".equals(type)) {
             if ("off".equals(policy.updateSource)) return failed("updates are turned off in the policy");
-            if ("github".equals(policy.updateSource)) updater.check(false); // server: the next check-in brings it
+            if ("github".equals(policy.updateSource)) { // server: the next check-in brings it
+                forceUpdateCheck = true;
+                updater.check(false);
+            }
         } else if ("show_message".equals(type)) {
             String text = Json.str(params, "text", "");
             if (text.length() == 0) return failed("no text");
@@ -2101,7 +2291,8 @@ public class MainActivity extends Activity {
             saver.hide();
         }
 
-        if (o.wakeOnMotion && resumed && (o.hasSchedule() || o.idleDimMinutes > 0 || o.screensaverMinutes > 0)) motion.start();
+        boolean forWaking = o.wakeOnMotion && (o.hasSchedule() || o.idleDimMinutes > 0 || o.screensaverMinutes > 0);
+        if (resumed && !safeMode && (forWaking || mqtt != null || pageWantsMotion)) motion.start(); // MQTT and pages hear of motion
         else motion.stop();
 
         if (!changed) return;
@@ -2170,6 +2361,12 @@ public class MainActivity extends Activity {
         if (now - lastTouch < o.idleHomeMinutes * MINUTE_MS) return;
         lastTouch = now;
         closeHelp();
+        if (o.clearSessionOnIdle && touchedSinceClear) {
+            // A shared tablet: the next person mustn't find the last one signed in
+            managed.addEvent("session_cleared", Json.obj("reason", "idle", "url", web.getUrl()));
+            clearWebData();
+            return;
+        }
         if (offline.showing() || atHome()) return;
         managed.addEvent("idle_home", Json.obj("url", web.getUrl()));
         loadHome();
@@ -2236,6 +2433,340 @@ public class MainActivity extends Activity {
     }
 
     // ======================================================================
+    // Shared tablets, update health and Wi-Fi
+    // ======================================================================
+
+    /** Signs out of everything: cookies, page storage, cache, form data and history, then the start page. */
+    private void clearWebData() {
+        touchedSinceClear = false;
+        deleteSnapshot(); // it may show the last person's page
+        CookieManager.getInstance().removeAllCookies(null);
+        CookieManager.getInstance().flush();
+        WebStorage.getInstance().deleteAllData();
+        if (web != null) {
+            web.clearCache(true);
+            web.clearFormData();
+            web.clearHistory();
+        }
+        closeHelp();
+        loadHome();
+    }
+
+    /** Once a minute: report how a new version is doing, and settle a Wi-Fi change. */
+    private void checkHealthAndWifi() {
+        JSONObject e = UpdateHealth.check(this);
+        if (e != null) {
+            managed.addEvent(Json.str(e, "type", ""), e.optJSONObject("data"));
+            shepherd.checkinSoon();
+        }
+        JSONObject w = Wifi.check(this);
+        if (w != null) managed.addEvent(Json.str(w, "type", ""), w.optJSONObject("data"));
+    }
+
+    /** wifi.networks from the policy (never in safe mode: a crashing version shouldn't touch the network). */
+    private void applyWifi() {
+        if (policy == null || safeMode || policy.wifiNetworks == null) return;
+        if (isDeviceOwner() && Build.VERSION.SDK_INT >= 23) {
+            try { // so status reports can say which network it's on
+                Lockdown.dpm(this).setPermissionGrantState(admin(), getPackageName(),
+                        "android.permission.ACCESS_FINE_LOCATION", 1 /* GRANTED */);
+            } catch (Exception ignored) {
+                // the SSID is left out of status reports
+            }
+        }
+        JSONObject e = Wifi.apply(this, policy.wifiNetworks);
+        if (e != null) managed.addEvent(Json.str(e, "type", ""), e.optJSONObject("data"));
+    }
+
+    // ======================================================================
+    // Page events, scanners, the offline picture and burn-in protection
+    // ======================================================================
+
+    /** {@code window.dispatchEvent(new CustomEvent("kiosky:<type>", {detail}))}, on the kiosk's own page only. */
+    private void pageEvent(String type, JSONObject detail) {
+        if (web == null || !trustedPage()) return;
+        String json = detail.toString().replace("\u2028", "\\u2028").replace("\u2029", "\\u2029");
+        try {
+            web.evaluateJavascript("window.dispatchEvent(new CustomEvent('kiosky:" + type + "',{detail:" + json + "}))", null);
+        } catch (Exception ignored) {
+            // the page is going away
+        }
+    }
+
+    /** An NFC tag or barcode: someone is here. Goes to the page and to MQTT. */
+    private void scanned(String type, JSONObject scan) {
+        wakeScreen(options().wakeMinutes);
+        lastTouch = SystemClock.elapsedRealtime();
+        touchedSinceClear = true;
+        pageEvent(type, scan);
+        if (mqtt != null) {
+            JSONObject m = Json.obj("event_type", "scanned");
+            for (java.util.Iterator<String> it = scan.keys(); it.hasNext(); ) {
+                String k = it.next();
+                Json.put(m, k, scan.opt(k));
+            }
+            mqtt.publish(type, m.toString(), false);
+        }
+    }
+
+    /** Every 3 minutes with screen.pixel_shift: move everything a pixel or so along a small circle. */
+    private void pixelShift() {
+        if (!options().pixelShift) {
+            if (shiftStep != 0) {
+                shiftStep = 0;
+                root.setTranslationX(0);
+                root.setTranslationY(0);
+            }
+            return;
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastShiftAt < 3 * MINUTE_MS) return;
+        lastShiftAt = now;
+        shiftStep = (shiftStep + 1) % SHIFT.length;
+        root.setTranslationX(SHIFT[shiftStep][0]);
+        root.setTranslationY(SHIFT[shiftStep][1]);
+    }
+
+    /**
+     * A picture of the page as it is now, for the offline screen: only of a page that
+     * loaded properly, with nothing over it. Kept in memory and in a file, so it
+     * survives a restart.
+     */
+    private void captureSnapshot() {
+        snapshotAt = SystemClock.elapsedRealtime();
+        Options o = options();
+        if (!o.offlineLastPage || web == null || !resumed || pageLoading || offline.showing() || pageError != null || errorThisLoad
+                || screenState == Options.OFF || saver.showing() || helpBox != null || overlay != null) return;
+        String url = web.getUrl();
+        if (url == null || isInternal(url)) return;
+        if (o.clearSessionOnIdle && !atHome()) return; // a visitor's own pages stay private
+        int w = web.getWidth(), h = web.getHeight();
+        if (w <= 0 || h <= 0) return;
+        float scale = Math.min(1f, 1280f / Math.max(w, h));
+        final Bitmap bmp;
+        try {
+            bmp = Bitmap.createBitmap(Math.max(1, Math.round(w * scale)), Math.max(1, Math.round(h * scale)), Bitmap.Config.ARGB_8888);
+            Canvas canvas = new Canvas(bmp);
+            canvas.scale(scale, scale);
+            web.draw(canvas);
+        } catch (Throwable e) {
+            return; // out of memory: keep the old one
+        }
+        snapshot = bmp;
+        snapshotHost = Policy.host(url);
+        snapshotOrientation = w > h ? 2 : 1;
+        snapshotLoaded = true;
+        getSharedPreferences(PREFS, 0).edit().putString("snapshot_host", snapshotHost)
+                .putInt("snapshot_orientation", snapshotOrientation).apply();
+        final java.io.File file = new java.io.File(getFilesDir(), SNAPSHOT_FILE);
+        new Thread(new Runnable() {
+            public void run() {
+                java.io.File tmp = new java.io.File(file.getPath() + ".tmp");
+                try {
+                    java.io.FileOutputStream out = new java.io.FileOutputStream(tmp);
+                    try {
+                        bmp.compress(Bitmap.CompressFormat.JPEG, 70, out);
+                    } finally {
+                        out.close();
+                    }
+                    if (!tmp.renameTo(file)) tmp.delete();
+                } catch (Exception e) {
+                    tmp.delete();
+                }
+            }
+        }).start();
+    }
+
+    /** The last good picture of {@code url}'s site, if it fits the screen as it is now. */
+    private Bitmap snapshotFor(String url) {
+        if (!options().offlineLastPage) return null;
+        if (!snapshotLoaded) { // after a restart: the picture from last time
+            snapshotLoaded = true;
+            SharedPreferences prefs = getSharedPreferences(PREFS, 0);
+            java.io.File f = new java.io.File(getFilesDir(), SNAPSHOT_FILE);
+            if (f.exists()) {
+                try {
+                    snapshot = BitmapFactory.decodeFile(f.getPath());
+                    snapshotHost = prefs.getString("snapshot_host", null);
+                    snapshotOrientation = prefs.getInt("snapshot_orientation", 0);
+                } catch (Throwable e) {
+                    snapshot = null;
+                }
+            }
+        }
+        if (snapshot == null || snapshotHost == null || !snapshotHost.equals(Policy.host(url))) return null;
+        int o = getResources().getConfiguration().orientation;
+        return o == snapshotOrientation ? snapshot : null;
+    }
+
+    private void deleteSnapshot() {
+        snapshot = null;
+        snapshotHost = null;
+        snapshotLoaded = true;
+        new java.io.File(getFilesDir(), SNAPSHOT_FILE).delete();
+    }
+
+    // ======================================================================
+    // Local control over MQTT (Home Assistant)
+    // ======================================================================
+
+    /** Starts, restarts or stops the MQTT connection to match the settings. */
+    private void applyMqtt() {
+        Options o = options();
+        String key = o.mqttEnabled() && !safeMode ? o.mqttKey() : null;
+        if (key == null ? mqttKey == null : key.equals(mqttKey)) return;
+        if (mqtt != null) mqtt.stop();
+        mqtt = null;
+        mqttKey = key;
+        mqttLastState = null;
+        if (key != null) {
+            mqtt = new Mqtt(this, o, mqttListener);
+            mqtt.start();
+        }
+        updateScreen(); // the motion sensors run while MQTT is on
+    }
+
+    private final Mqtt.Listener mqttListener = new Mqtt.Listener() {
+        public void onConnected() {
+            if (mqtt == null) return;
+            mqtt.publishDiscovery(Mqtt.deviceName(options(), managed.isManaged() ? managed.name() : null),
+                    Build.MANUFACTURER + " " + Build.MODEL, Updater.currentVersion(MainActivity.this));
+            mqttLastState = null;
+            publishMqttState();
+            mqtt.publish("motion", motionOn ? "ON" : "OFF", true);
+        }
+
+        public void onCommand(String name, String payload) {
+            mqttCommand(name, payload == null ? "" : payload.trim());
+        }
+    };
+
+    /** The state message, sent when anything in it changes (checked every 15 s and after commands). */
+    private void publishMqttState() {
+        if (mqtt == null || !mqtt.connected()) return;
+        JSONObject st = Json.obj(
+                "screen", screenState == Options.OFF ? "off" : (screenState == Options.DIM ? "dim" : "on"),
+                "brightness", brightnessPercent(),
+                "volume", volumePercent() >= 0 ? Integer.valueOf(volumePercent()) : null,
+                "url", web != null ? web.getUrl() : null,
+                "title", web != null ? web.getTitle() : null,
+                "screensaver", saver.showing(),
+                "offline", offline.showing(),
+                "wifi_rssi", DeviceInfo.wifiRssi(this),
+                "app_version", Updater.currentVersion(this));
+        Intent b = Battery.read(this);
+        int level = b == null ? -1 : Battery.level(b);
+        float temp = b == null ? Float.NaN : Battery.temperature(b);
+        Json.put(st, "battery_level", level >= 0 ? Integer.valueOf(level) : null);
+        Json.put(st, "charging", b != null && Battery.charging(b));
+        Json.put(st, "battery_temperature", Float.isNaN(temp) ? null : Double.valueOf(Math.round(temp * 10) / 10.0));
+        String text = st.toString();
+        if (text.equals(mqttLastState)) return;
+        mqttLastState = text;
+        mqtt.publish("state", text, true);
+    }
+
+    /** The brightness the screen has when it's on: dimmed, set by a page or MQTT, or the tablet's own. */
+    private Integer brightnessPercent() {
+        if (screenState == Options.DIM) return options().dimBrightness;
+        if (pageBrightness >= 0) return Math.round(pageBrightness * 100);
+        try {
+            int v = android.provider.Settings.System.getInt(getContentResolver(), "screen_brightness", -1);
+            return v < 0 ? null : Integer.valueOf(Json.clamp(Math.round(v * 100f / 255), 1, 100));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** {@code <base>/cmd/<name>}: what a home server can ask of the tablet. */
+    private void mqttCommand(String name, String p) {
+        if ("wake".equals(name)) {
+            int minutes = parseInt(p, 0);
+            wakeScreen(minutes > 0 ? Json.clamp(minutes, 1, 240) : options().wakeMinutes);
+        } else if ("screen".equals(name)) {
+            if ("OFF".equalsIgnoreCase(p) || "0".equals(p) || "false".equalsIgnoreCase(p)) {
+                manualOff = true; // like window.kiosky.screenOff(): until a touch or a wake
+                updateScreen();
+            } else {
+                wakeScreen(options().wakeMinutes);
+            }
+        } else if ("screen_off".equals(name)) {
+            manualOff = true;
+            updateScreen();
+        } else if ("brightness".equals(name)) {
+            int v = parseInt(p, -1);
+            pageBrightness = v <= 0 ? -1f : Json.clamp(v, 1, 100) / 100f;
+            updateScreen();
+        } else if ("volume".equals(name)) {
+            int v = parseInt(p, -1);
+            if (v >= 0) Speaker.Volume.setPercent(this, Json.clamp(v, 0, 100));
+        } else if ("set_url".equals(name)) {
+            openTemporary(p);
+        } else if ("go_home".equals(name)) {
+            closeHelp();
+            loadHome();
+        } else if ("reload".equals(name)) {
+            if (web != null) web.reload();
+        } else if ("announce".equals(name)) {
+            String text = p;
+            int volume = -1;
+            JSONObject j = p.startsWith("{") ? Json.parse(p) : null;
+            if (j != null) { // {"text": "…", "volume": 80}; "message" also works
+                text = Json.str(j, "text", Json.str(j, "message", "")).trim();
+                if (j.has("volume")) volume = Json.clamp(j.optInt("volume", -1), 0, 100);
+            }
+            if (text.length() == 0) return;
+            if (speaker == null) speaker = new Speaker(this);
+            speaker.say(text, volume);
+        } else if ("clear_session".equals(name)) {
+            managed.addEvent("session_cleared", Json.obj("reason", "mqtt", "url", web != null ? web.getUrl() : null));
+            clearWebData();
+        } else {
+            return; // unknown: ignore, so newer home servers don't break older tablets
+        }
+        handler.removeCallbacks(mqttRefresh);
+        handler.postDelayed(mqttRefresh, 1000); // report the result
+    }
+
+    /**
+     * set_url (MQTT) and window.kiosky.setUrl(): shows an address until going home (idle, go_home, a restart). A managed
+     * tablet still keeps to allowed_hosts.
+     */
+    private void openTemporary(String url) {
+        if (web == null || !(url.startsWith("https://") || url.startsWith("http://"))) return;
+        if (sameUrl(url, homeUrl())) {
+            loadHome();
+            return;
+        }
+        if (!allowed(url)) {
+            blocked(url);
+            return;
+        }
+        closeHelp();
+        onTemporaryPage = true;
+        web.loadUrl(url);
+    }
+
+    /** A touch or the proximity/light sensor: motion ON, and OFF after 30 s without any. */
+    private void motionSeen() {
+        if (mqtt == null) return;
+        handler.removeCallbacks(motionOff);
+        handler.postDelayed(motionOff, 30000);
+        if (!motionOn) {
+            motionOn = true;
+            mqtt.publish("motion", "ON", true);
+        }
+    }
+
+    private static int parseInt(String s, int def) {
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (Exception e) {
+            return def;
+        }
+    }
+
+    // ======================================================================
     // Local settings (unmanaged tablets)
     // ======================================================================
 
@@ -2276,6 +2807,25 @@ public class MainActivity extends Activity {
                 Json.str(cur, "watchdog_minutes", "2"), true);
         final CheckBox camera = check(form, "Pages may use the camera", media == null || media.optBoolean("camera", true));
         final CheckBox mic = check(form, "Pages may use the microphone", media == null || media.optBoolean("microphone", true));
+        JSONObject session = cur.optJSONObject("session");
+        final CheckBox clearSession = check(form, "Shared tablet: going back to the start page also signs out and "
+                + "forgets what pages stored", session != null && session.optBoolean("clear_on_idle", false));
+
+        heading(form, "Touch");
+        JSONObject tch = cur.optJSONObject("touch");
+        final CheckBox zoom = check(form, "Pinch to zoom", tch != null && tch.optBoolean("zoom", false));
+        final CheckBox longPress = check(form, "Long press (selecting text and its Copy/Share menu, link previews)",
+                tch == null || tch.optBoolean("long_press", true));
+        final CheckBox selectText = check(form, "Selecting the page's text (text boxes always allow it)",
+                tch == null || tch.optBoolean("text_selection", true));
+
+        heading(form, "Scanners");
+        JSONObject inp = cur.optJSONObject("input");
+        final CheckBox nfcBox = check(form, scanInput.nfcPresent() ? "Read NFC tags and send them to the page (see Help)"
+                : "Read NFC tags (this tablet has no NFC)", inp != null && inp.optBoolean("nfc", false));
+        nfcBox.setEnabled(scanInput.nfcPresent());
+        final CheckBox barcodeBox = check(form, "Send barcode scanner input to the page (USB or Bluetooth scanners)",
+                inp == null || inp.optBoolean("barcode", true));
 
         heading(form, "Playlist");
         JSONObject pl = cur.optJSONObject("playlist");
@@ -2310,12 +2860,38 @@ public class MainActivity extends Activity {
         final EditText rebootAt = field(form, "Restart every day at (HH:MM, empty: never; a full reboot when device owner)",
                 Json.str(cur, "reboot_at", ""), false);
         final CheckBox uploads = check(form, "Pages may upload files", cur.optBoolean("file_uploads", true));
+        final CheckBox shift = check(form, "Move the page a pixel or two every few minutes (against screen burn-in)",
+                scr != null && scr.optBoolean("pixel_shift", false));
+        JSONObject off = cur.optJSONObject("offline");
+        final CheckBox lastPage = check(form, "While reconnecting, show the last page greyed out",
+                off == null || off.optBoolean("last_page", true));
         final CheckBox forget = check(form, "Forget saved sign-ins and trusted certificates", false);
 
         heading(form, "Battery");
         JSONObject bat = cur.optJSONObject("battery");
         final CheckBox protect = check(form, "Limit charging to protect the battery (Samsung, experimental; see Help)",
                 bat != null && bat.optBoolean("protect", false));
+
+        heading(form, "Home Assistant (MQTT)");
+        JSONObject mq = cur.optJSONObject("mqtt");
+        TextView mqState = new TextView(this);
+        mqState.setText(mqtt == null ? (safeMode ? "Off: safe mode after a failed update" : "Off")
+                : "Topic " + mqtt.base + ": " + mqtt.status);
+        form.addView(mqState, new LinearLayout.LayoutParams(-1, -2));
+        final EditText mqHost = textField(form, "Broker address (empty: off)", Json.str(mq, "host", ""), 0x1 | 0x10);
+        final EditText mqPort = field(form, "Port (1883, or 8883 with TLS)",
+                Json.str(mq, "port", mq != null && mq.optBoolean("tls", false) ? "8883" : "1883"), true);
+        final CheckBox mqTls = check(form, "Use TLS (encrypted)", mq != null && mq.optBoolean("tls", false));
+        final EditText mqFp = textField(form, "Certificate fingerprint, for a self-signed broker (SHA-256, optional)",
+                Json.str(mq, "fingerprint", ""), 0x1 | 0x80000 /* TEXT | NO_SUGGESTIONS */);
+        final EditText mqUser = textField(form, "Username (optional)", Json.str(mq, "username", ""), 0x1 | 0x80000);
+        final EditText mqPass = textField(form, "Password", Json.str(mq, "password", ""), 0x81 /* TEXT | PASSWORD */);
+        final EditText mqTopic = textField(form, "Topic (empty: kiosky/<tablet>)", Json.str(mq, "topic", ""), 0x1 | 0x80000);
+        final EditText mqName = textField(form, "Name in Home Assistant (empty: " + Mqtt.deviceName(localOptions, null) + ")",
+                Json.str(mq, "name", ""), 0x1 | 0x2000 /* TEXT | CAP_WORDS */);
+        final CheckBox mqDiscovery = check(form, "Add it to Home Assistant automatically (MQTT discovery)",
+                mq == null || mq.optBoolean("discovery", true));
+        final String mqPrefix = Json.str(mq, "discovery_prefix", "homeassistant");
 
         ScrollView scroll = new ScrollView(this);
         scroll.addView(form, new FrameLayout.LayoutParams(-1, -2));
@@ -2336,7 +2912,12 @@ public class MainActivity extends Activity {
                                         "wake_minutes", number(wakeMin, 5),
                                         "dim_at", text(dimAt), "dim_until", text(dimUntil),
                                         "dim_brightness", number(dimPct, 15),
-                                        "idle_dim_minutes", number(idleDim, 0)),
+                                        "idle_dim_minutes", number(idleDim, 0),
+                                        "pixel_shift", shift.isChecked()),
+                                "touch", Json.obj("zoom", zoom.isChecked(), "long_press", longPress.isChecked(),
+                                        "text_selection", selectText.isChecked()),
+                                "offline", Json.obj("last_page", lastPage.isChecked()),
+                                "input", Json.obj("nfc", nfcBox.isChecked(), "barcode", barcodeBox.isChecked()),
                                 "battery", Json.obj("protect", protect.isChecked()),
                                 "playlist", Json.obj("urls", lines(playlist), "seconds", number(plSeconds, 60),
                                         "pause_on_touch_seconds", number(plPause, 120)),
@@ -2345,7 +2926,13 @@ public class MainActivity extends Activity {
                                         "quiet_at", text(quietAt), "quiet_until", text(quietUntil),
                                         "quiet_volume", number(quietVol, 0)),
                                 "file_uploads", uploads.isChecked(),
-                                "reboot_at", text(rebootAt));
+                                "reboot_at", text(rebootAt),
+                                "session", Json.obj("clear_on_idle", clearSession.isChecked()),
+                                "mqtt", Json.obj("host", text(mqHost), "port", number(mqPort, mqTls.isChecked() ? 8883 : 1883),
+                                        "tls", mqTls.isChecked(), "fingerprint", text(mqFp),
+                                        "username", text(mqUser), "password", mqPass.getText() == null ? "" : mqPass.getText().toString(),
+                                        "topic", text(mqTopic), "name", text(mqName),
+                                        "discovery", mqDiscovery.isChecked(), "discovery_prefix", mqPrefix));
                         String problem = timesProblem(text(offAt), text(onAt), "off")
                                 + timesProblem(text(dimAt), text(dimUntil), "dimming")
                                 + timesProblem(text(quietAt), text(quietUntil), "quiet hours");
@@ -2362,6 +2949,23 @@ public class MainActivity extends Activity {
                         if (text(ssUrl).length() > 0 && !text(ssUrl).startsWith("https://")) {
                             problem += "The screensaver page must start with https://. ";
                         }
+                        if (clearSession.isChecked() && number(idleHome, 0) <= 0) {
+                            problem += "To sign out a shared tablet, set how many minutes untouched it goes back to the start page. ";
+                        }
+                        int port = number(mqPort, -1);
+                        if (text(mqHost).length() > 0 && (port < 1 || port > 65535)) {
+                            problem += "The MQTT port must be a number from 1 to 65535. ";
+                        }
+                        if (text(mqHost).indexOf("://") >= 0 || text(mqHost).indexOf('/') >= 0) {
+                            problem += "Enter just the broker's name or IP address, like 192.168.1.10. ";
+                        }
+                        String fp = Trust.normalise(text(mqFp));
+                        if (text(mqFp).length() > 0 && fp.length() != 64) {
+                            problem += "The certificate fingerprint should be 64 hex digits (SHA-256). ";
+                        }
+                        if (text(mqTopic).indexOf('+') >= 0 || text(mqTopic).indexOf('#') >= 0) {
+                            problem += "The MQTT topic can't contain + or #. ";
+                        }
                         if (problem.length() > 0) {
                             toast(problem.trim());
                             showSettingsForm(o);
@@ -2373,6 +2977,10 @@ public class MainActivity extends Activity {
                         appliedVolume = -2;
                         applyVolume();
                         schedulePlaylist();
+                        applyMqtt();
+                        applyWebSettings();
+                        scanInput.setNfc(localOptions.nfc && resumed && !safeMode);
+                        if (!localOptions.offlineLastPage) deleteSnapshot();
                         lastTouch = lastActivity = SystemClock.elapsedRealtime();
                         updateScreen();
                         checkBattery();
@@ -2421,6 +3029,12 @@ public class MainActivity extends Activity {
         e.setInputType(numeric ? 0x2 /* TYPE_CLASS_NUMBER */ : 0x4 | 0x20 /* TYPE_CLASS_DATETIME | TIME */);
         e.setText(value);
         form.addView(e, new LinearLayout.LayoutParams(-1, -2));
+        return e;
+    }
+
+    private EditText textField(LinearLayout form, String label, String value, int inputType) {
+        EditText e = field(form, label, value, false);
+        e.setInputType(inputType);
         return e;
     }
 
@@ -3005,6 +3619,11 @@ public class MainActivity extends Activity {
         b.append("\nStatus: ").append(shepherd.lastError != null ? shepherd.lastError : "OK");
         b.append("\nStart on boot permission: ").append(DeviceInfo.overlayPermission(this) ? "granted" : "missing");
         b.append("\nInstall permission: ").append(DeviceInfo.installPermission(this) ? "granted" : "missing");
+        b.append("\nMQTT: ").append(mqtt == null ? "off" : mqtt.base + " (" + mqtt.status + ")");
+        if (policy.wifiNetworks != null) b.append("\nWi-Fi settings: ").append(Wifi.status(this));
+        String health = UpdateHealth.state(this);
+        if (health != null) b.append("\nThis version: ").append(health);
+        if (safeMode) b.append("\nSafe mode: on (this version crashed right after updating)");
         dialog()
                 .setTitle("Device info")
                 .setMessage(b.toString())

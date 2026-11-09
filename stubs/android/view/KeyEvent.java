@@ -1,1 +1,1 @@
-package android.view; public class KeyEvent { public final int getKeyCode(){return 0;} public final int getAction(){return 0;} }
+package android.view; public class KeyEvent { public final int getKeyCode(){return 0;} public final int getAction(){return 0;} public int getUnicodeChar(){return 0;} public final long getEventTime(){return 0;} public final int getRepeatCount(){return 0;} }

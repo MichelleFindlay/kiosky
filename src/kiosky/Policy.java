@@ -38,6 +38,7 @@ final class Policy {
     final String updateSource;       // server | github | off
     final boolean autoInstall;
     final int checkHours;
+    final int rolloutHours;          // github source: spread automatic installs over this many hours
 
     final int checkinSeconds;
 
@@ -47,6 +48,7 @@ final class Policy {
     final String httpAuthUser;
     final String httpAuthPassword;
     final String[] trustedCertificates; // SHA-256 fingerprints, normalised hex
+    final JSONArray wifiNetworks;    // [{ssid, password, security, hidden}]; null: leave Wi-Fi alone
 
     Policy(JSONObject p) {
         version = Json.str(p, "version", "");
@@ -81,6 +83,7 @@ final class Policy {
         updateSource = ("github".equals(src) || "off".equals(src)) ? src : "server";
         autoInstall = up == null || up.optBoolean("auto_install", true);
         checkHours = Json.clamp(up == null ? 12 : up.optInt("check_hours", 12), 1, 168);
+        rolloutHours = Json.clamp(up == null ? 0 : up.optInt("rollout_hours", 0), 0, 336);
 
         checkinSeconds = Json.clamp(p.optInt("checkin_seconds", 60), 15, 3600);
         options = new Options(p);
@@ -93,6 +96,38 @@ final class Policy {
         int nc = certs == null ? 0 : certs.length();
         trustedCertificates = new String[nc];
         for (int i = 0; i < nc; i++) trustedCertificates[i] = Trust.normalise(certs.optString(i, ""));
+        JSONObject wifi = p.optJSONObject("wifi");
+        JSONArray nets = wifi == null || wifi.optJSONArray("networks") == null ? null : networks(wifi.optJSONArray("networks"));
+        // Shepherd sends every key, so an empty list means the same as none: leave Wi-Fi alone
+        wifiNetworks = nets == null || nets.length() == 0 ? null : nets;
+    }
+
+    /**
+     * The usable entries of {@code wifi.networks}, in order (the first is preferred),
+     * normalised so the same networks always compare equal. Entries without an SSID,
+     * or with a password Wi-Fi can't use (8 to 63 characters, or 64 hex digits), are
+     * left out.
+     */
+    private static JSONArray networks(JSONArray in) {
+        JSONArray out = new JSONArray();
+        for (int i = 0; i < in.length() && out.length() < 10; i++) {
+            JSONObject n = in.optJSONObject(i);
+            if (n == null) continue;
+            String ssid = Json.str(n, "ssid", "");
+            if (ssid.length() == 0 || ssid.length() > 32) continue;
+            String password = Json.str(n, "password", "");
+            String security = Json.str(n, "security", password.length() == 0 ? "open" : "wpa2").toLowerCase(Locale.ROOT);
+            if (!"open".equals(security) && !"wpa3".equals(security)) security = "wpa2";
+            if ("open".equals(security)) {
+                password = "";
+            } else {
+                boolean hex = password.length() == 64 && password.matches("[0-9a-fA-F]+");
+                if (!hex && (password.length() < 8 || password.length() > 63)) continue;
+            }
+            out.put(Json.obj("ssid", ssid, "password", password, "security", security,
+                    "hidden", n.optBoolean("hidden", false)));
+        }
+        return out;
     }
 
     boolean trustsCertificate(String fingerprint) {

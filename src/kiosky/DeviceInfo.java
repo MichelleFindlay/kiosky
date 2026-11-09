@@ -111,14 +111,22 @@ final class DeviceInfo {
         String ip = localIp();
         if (ip != null) Json.put(s, "local_ip", ip);
 
-        try {
-            WifiManager wm = (WifiManager) a.getApplicationContext().getSystemService("wifi");
-            WifiInfo info = wm == null ? null : wm.getConnectionInfo();
-            if (info != null && info.getRssi() > -127) Json.put(s, "wifi_rssi", info.getRssi());
-        } catch (Exception ignored) {
-            // no Wi-Fi or no permission
-        }
+        Integer rssi = wifiRssi(a);
+        if (rssi != null) Json.put(s, "wifi_rssi", rssi);
+        String ssid = Wifi.currentSsid(a); // needs the location permission, which a device owner grants itself
+        if (ssid != null) Json.put(s, "wifi_ssid", ssid);
         return s;
+    }
+
+    /** Wi-Fi signal in dBm, or null. */
+    static Integer wifiRssi(Context c) {
+        try {
+            WifiManager wm = (WifiManager) c.getApplicationContext().getSystemService("wifi");
+            WifiInfo info = wm == null ? null : wm.getConnectionInfo();
+            return info != null && info.getRssi() > -127 ? Integer.valueOf(info.getRssi()) : null;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private static String localIp() {

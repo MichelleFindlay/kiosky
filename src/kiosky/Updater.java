@@ -42,8 +42,11 @@ final class Updater {
     private static final String EXTRA_TOKEN = "token";
 
     interface Listener {
-        /** A newer release is available. Called on the main thread. */
-        void onUpdateAvailable(String version, String apkUrl, long size);
+        /**
+         * A newer release is available. {@code publishedAt}: when GitHub published it
+         * (0 if unknown); {@code manual}: someone asked for this check. Main thread.
+         */
+        void onUpdateAvailable(String version, String apkUrl, long size, long publishedAt, boolean manual);
         /** Download or install stopped without updating. Called on the main thread. */
         void onInstallFailed(String reason);
     }
@@ -156,9 +159,10 @@ final class Updater {
                     } else {
                         final String url = apk;
                         final long len = size;
+                        final long published = parseTime(rel.optString("published_at", ""));
                         main.post(new Runnable() {
                             public void run() {
-                                listener.onUpdateAvailable(stripV(tag), url, len);
+                                listener.onUpdateAvailable(stripV(tag), url, len, published, manual);
                             }
                         });
                     }
@@ -253,6 +257,33 @@ final class Updater {
                 }
             }
         }).start();
+    }
+
+    /** GitHub's "2026-11-09T13:28:00Z" to milliseconds, or 0. */
+    static long parseTime(String iso) {
+        try {
+            java.text.SimpleDateFormat f = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US);
+            f.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+            return f.parse(iso).getTime();
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    /**
+     * How long after a release this tablet installs it automatically, spread evenly
+     * over {@code hours} by a hash of the device id, so a bad release reaches only
+     * some tablets before it can be pulled.
+     */
+    static long rolloutDelayMs(Context c, int hours) {
+        if (hours <= 0) return 0;
+        try {
+            byte[] h = MessageDigest.getInstance("SHA-256").digest(Mqtt.deviceId(c).getBytes("UTF-8"));
+            long v = ((h[0] & 0xFFL) << 24) | ((h[1] & 0xFFL) << 16) | ((h[2] & 0xFFL) << 8) | (h[3] & 0xFFL);
+            return (long) (v / 4294967296.0 * hours * 3600000L);
+        } catch (Exception e) {
+            return 0;
+        }
     }
 
     private static String hex(byte[] b) {

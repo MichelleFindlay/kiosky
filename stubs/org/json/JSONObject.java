@@ -4,4 +4,6 @@ package org.json; public class JSONObject { public static final Object NULL = ne
  public String getString(String n) throws JSONException {return null;} public String optString(String n){return null;} public String optString(String n,String d){return null;}
  public int optInt(String n,int d){return 0;} public long optLong(String n,long d){return 0;} public boolean optBoolean(String n,boolean d){return false;}
  public JSONArray optJSONArray(String n){return null;} public JSONObject optJSONObject(String n){return null;}  public String toString(int indent) throws JSONException {return null;}
+ public Object opt(String n){return null;} public java.util.Iterator<String> keys(){return null;} public Object remove(String n){return null;}
+ public int optInt(String n){return 0;} public long optLong(String n){return 0;} public boolean optBoolean(String n){return false;}
 }

@@ -40,6 +40,24 @@ version sees: `java -cp .tools/signer.jar tools/CheckSigning.java kiosky.apk`.
 On tablets set up with adb, turn **USB debugging** off afterwards. Physical access
 with debugging on is the realistic way a leaked key gets abused.
 
+## Tests
+
+`./test.sh` runs the JUnit tests in `test/` for the parts that don't need Android:
+`Policy`, `Options`, `Pin` (checked against RFC 7914 and the JDK's PBKDF2), `Json`,
+`Markdown`, and the help translations. It needs a JDK and curl; JUnit and org.json
+are downloaded from Maven Central on first run and checked by SHA-256.
+`test/fakes/` holds working versions of the Android classes those parts touch
+(only `Base64` so far). GitHub Actions runs it on every push.
+
+## Help translations
+
+The app shows `app/assets/help.<language>.md` when the tablet's language has one
+(German, French and Spanish so far), and `help.md` otherwise. Kiosky's own button
+names stay in English in the translations, as they appear on screen. When you
+change `help.md`, change the translations too: `HelpTest` fails if their sections,
+tables or code blocks no longer match. To add a language, copy `help.md` to
+`help.<code>.md` (the two-letter ISO 639-1 code) and translate it.
+
 ## Versions and updates
 
 The version is set in two places that must match: `app/AndroidManifest.xml` and `app/apktool.yml`. `versionName` is `MAJOR.MINOR.PATCH`. `versionCode` must always go up; use `MAJOR*10000 + MINOR*100 + PATCH` (1.0.0 → 10000, 1.2.3 → 10203).
@@ -98,6 +116,36 @@ New status keys: `screen_schedule` (`off`/`on`, when a schedule is set), `screen
 Pages can call `window.kiosky`: `wake()`, `isScreenOff()` and `version()` from any page; `reload()`, `setBrightness(percent)`, `screenOff()` and `deviceName()` only from a trusted page (the `url` host, `allowed_hosts` entries or an admin-sent page; unmanaged, the saved address's host).
 
 New commands: `wake_screen` (`minutes`, default `screen.wake_minutes`), `announce` (`text`, `volume`), `reboot` (device owner). `diagnostics` and `live_view` (already in the protocol) are now implemented, and screenshots show the whole screen. More events: `crash` (at the next start), `certificate_untrusted`, `screensaver`, `rebooting`, `restarting`, `reboot_failed`; more status: `screensaver`, `reboot_supported`, `volume_percent`, `playlist_index`.
+
+### Added in 1.8.0
+
+Policy keys (older apps ignore them):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `session.clear_on_idle` | `false` | At `idle_home_minutes`, also clear cookies, site storage, cache, form data and history (only if the tablet was touched since the last clear). For shared, public tablets |
+| `mqtt.host`, `mqtt.port`, `mqtt.tls`, `mqtt.fingerprint` | `""`, `1883` (`8883` with TLS), `false`, `""` | MQTT broker for local control. `fingerprint`: SHA-256 of a self-signed broker certificate, trusted instead of the system CAs |
+| `mqtt.username`, `mqtt.password` | `""` | Broker sign-in |
+| `mqtt.topic`, `mqtt.name` | `""` | Base topic (default `kiosky/<first 8 of android_id>`) and the device name in Home Assistant |
+| `mqtt.discovery`, `mqtt.discovery_prefix` | `true`, `"homeassistant"` | Home Assistant MQTT discovery |
+| `wifi.networks` | absent | `[{"ssid", "password", "security": "wpa2" \| "wpa3" \| "open", "hidden"}]`, first preferred, at most 10. Saved on the tablet (device owner on Android 10+). Absent or empty: Kiosky leaves Wi-Fi alone (networks it saved stay saved) |
+| `touch.zoom`, `touch.long_press`, `touch.text_selection` | `false`, `true`, `true` | Pinch to zoom; long presses (off: no text selection, action menu or link previews); selecting page text (off: `user-select: none` except form fields) |
+| `offline.last_page` | `true` | Behind the "Reconnecting…" banner, a greyed-out picture of the last page that loaded properly on that host (`OfflineScreen.java`) |
+| `screen.pixel_shift` | `false` | Every 3 minutes, move everything along an 8-step circle of at most 2 px, against burn-in |
+| `input.nfc`, `input.barcode` | `false`, `true` | NFC reader mode while in front, and keyboard-style barcode scanners (`ScanInput.java`). Scans go to trusted pages as `kiosky:nfc` / `kiosky:barcode` events and to MQTT |
+| `updates.rollout_hours` | `0` | `github` source with `auto_install`: each tablet installs a release at a fixed point, spread over this many hours after it's published (by a hash of its android_id). `check_update` skips the wait |
+
+The `session.*`, `mqtt.*`, `touch.*`, `offline.*`, `input.*` and `screen.pixel_shift` keys are shared with the local **Settings** dialog (`Options.java`). MQTT topics and payloads are in [help.md](app/assets/help.md#home-assistant-and-mqtt).
+
+**Wi-Fi safety** (`Wifi.java`): new networks are added before old ones go; networks Kiosky saved that the policy dropped are removed only once Wi-Fi works again, and never the one in use. A changed password or security type is put back if Wi-Fi isn't connected 10 minutes later, and that policy isn't retried until it changes. Kiosky only touches networks it saved itself.
+
+**Update health** (`UpdateHealth.java`): for 15 minutes after a new version code first starts, uncaught crashes are counted. Two make it unhealthy: Kiosky reports `update_unhealthy` and runs in safe mode (no MQTT, motion sensors, Wi-Fi changes or restored page) until a newer version arrives. Android can't downgrade an app, so the way back is a newer build; to roll back, rebuild the previous version with a higher `versionCode`. Surviving the trial reports `update_healthy`, which a server can use to advance a staged rollout.
+
+New events: `session_cleared` (`reason`: `idle` or `mqtt`, `url`), `update_unhealthy` / `update_healthy` (`version`, `version_code`, `previous_version`, `previous_version_code`, `crashes`, and `last_crash` when unhealthy), `wifi_changed` / `wifi_failed` (`networks`, `failed`: the SSIDs Android refused), `wifi_applied` (`networks`, `removed`, `ssid`), `wifi_reverted` (`restored`, `networks`). `app_started` carries `safe_mode: true` in safe mode.
+
+`window.kiosky` gains `speak(text)`, `battery()`, `setUrl(url)`, `watchMotion(on)` (then `kiosky:motion` events) and `nfcAvailable()`; see [help.md](app/assets/help.md#controlling-the-tablet-from-a-dashboard).
+
+New status keys: `mqtt` (`off`, `connecting`, `connected` or `error: …`), `wifi_config` (`off`, `pending`, `applied`, `reverted`, `failed`, `not_device_owner`), `wifi_ssid` (when Android reveals it: a device owner grants itself the location permission once the policy has `wifi`), `update_health` (`trial`, `healthy`, `unhealthy`; only after an update), `safe_mode`.
 
 **QR provisioning** (`Provisioning.java`, `AdminReceiver.java`): a factory-reset tablet scanning Shepherd's provisioning QR installs Kiosky as device owner and enrolls with the code in its admin extras (PROTOCOL.md §3.3). The signature checksum for the release key is `5D43Qjavxg_OZaPbJfD5a9QWhnhi6drJw8uro0Zl9I8` (Android 9+); Shepherd uses the APK's own checksum when it serves the download, which works on every version.
 

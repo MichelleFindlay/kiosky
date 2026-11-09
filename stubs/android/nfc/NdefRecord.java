@@ -1,0 +1,1 @@
+package android.nfc; public final class NdefRecord { public short getTnf(){return 0;} public byte[] getType(){return null;} public byte[] getPayload(){return null;} public android.net.Uri toUri(){return null;} public String toMimeType(){return null;} }

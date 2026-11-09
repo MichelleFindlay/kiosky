@@ -36,6 +36,7 @@ final class Crashes {
                             "stack", stack, "app_version", version,
                             "at_ms", System.currentTimeMillis()).toString();
                     prefs.edit().putString(PENDING, json).putString(LAST, json).commit(); // commit: we're about to die
+                    UpdateHealth.crashed(prefs, System.currentTimeMillis());
                 } catch (Throwable ignored) {
                     // never make a crash worse
                 }
