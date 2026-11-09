@@ -41,6 +41,13 @@ final class Policy {
 
     final int checkinSeconds;
 
+    final Options options;           // idle, watchdog, camera/microphone, screen schedule
+
+    final String httpAuthHost;       // "": the start page's host
+    final String httpAuthUser;
+    final String httpAuthPassword;
+    final String[] trustedCertificates; // SHA-256 fingerprints, normalised hex
+
     Policy(JSONObject p) {
         version = Json.str(p, "version", "");
         organisation = Json.str(p, "organisation", "your organisation");
@@ -76,6 +83,29 @@ final class Policy {
         checkHours = Json.clamp(up == null ? 12 : up.optInt("check_hours", 12), 1, 168);
 
         checkinSeconds = Json.clamp(p.optInt("checkin_seconds", 60), 15, 3600);
+        options = new Options(p);
+
+        JSONObject auth = p.optJSONObject("http_auth");
+        httpAuthHost = Json.str(auth, "host", "").trim().toLowerCase(Locale.ROOT);
+        httpAuthUser = Json.str(auth, "username", "");
+        httpAuthPassword = Json.str(auth, "password", "");
+        JSONArray certs = p.optJSONArray("trusted_certificates");
+        int nc = certs == null ? 0 : certs.length();
+        trustedCertificates = new String[nc];
+        for (int i = 0; i < nc; i++) trustedCertificates[i] = Trust.normalise(certs.optString(i, ""));
+    }
+
+    boolean trustsCertificate(String fingerprint) {
+        for (String c : trustedCertificates) if (c.length() == 64 && c.equals(fingerprint)) return true;
+        return false;
+    }
+
+    /** Playlist pages are always allowed, like the start page (§5.2). */
+    boolean inPlaylist(String target) {
+        String host = host(target);
+        if (host == null) return false;
+        for (String u : options.playlistUrls) if (host.equals(host(u))) return true;
+        return false;
     }
 
     static Policy parse(String json) {
@@ -101,9 +131,25 @@ final class Policy {
         String host = host(target);
         if (host == null) return false;
         if (!"https".equalsIgnoreCase(scheme(target))) return false;
-        if (host.equals(host(url))) return true;
+        if (host.equals(host(url)) || inPlaylist(target)) return true;
         if (allowedHosts.length == 0) return true;
+        return listed(target);
+    }
 
+    /**
+     * Whether {@code target} is the start page's host or matches an allowed_hosts entry.
+     * Unlike {@link #allows}, an empty list allows nothing more: camera and microphone
+     * access follows this stricter rule.
+     */
+    boolean trusted(String target) {
+        String host = host(target);
+        if (host == null || !"https".equalsIgnoreCase(scheme(target))) return false;
+        return host.equals(host(url)) || listed(target);
+    }
+
+    private boolean listed(String target) {
+        String host = host(target);
+        if (host == null) return false;
         int port = port(target);
         for (String entry : allowedHosts) {
             if (entry.length() == 0) continue;

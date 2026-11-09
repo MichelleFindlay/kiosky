@@ -279,8 +279,8 @@ final class Shepherd {
             // Screenshots are too big to keep. If this send fails, the stored result
             // re-sent later says so, rather than silently taking a new picture.
             final JSONObject toSend = result;
-            JSONObject toKeep = result.has("screenshot")
-                    ? Json.obj("status", "failed", "message", "the screenshot didn't reach the server; send the command again")
+            JSONObject toKeep = result.has("screenshot") || result.has("bundle")
+                    ? Json.obj("status", "failed", "message", "the result didn't reach the server; send the command again")
                     : result;
             state.putDone(id, toKeep, false);
             net.execute(new Runnable() {
@@ -300,6 +300,31 @@ final class Shepherd {
             }
         });
         return false;
+    }
+
+    /** Called on the main thread with the HTTP status of a live-view frame (0: network error). */
+    interface FrameSent {
+        void onSent(int code);
+    }
+
+    /** One live-view frame (§7 live_view): POST /api/v1/device/live. */
+    void sendLiveFrame(final String base64, final FrameSent done) {
+        final String server = state.server();
+        final String token = state.token();
+        if (stopped || server == null || token == null) {
+            done.onSent(410);
+            return;
+        }
+        net.execute(new Runnable() {
+            public void run() {
+                final Resp r = call("POST", server, "/api/v1/device/live", Json.obj("screenshot", base64), token);
+                main.post(new Runnable() {
+                    public void run() {
+                        done.onSent(r.code);
+                    }
+                });
+            }
+        });
     }
 
     /** Background thread. Marks the result sent once the server has it. */

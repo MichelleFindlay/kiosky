@@ -1,0 +1,1 @@
+package android.net.http; public class SslCertificate { public java.security.cert.X509Certificate getX509Certificate(){return null;} public static android.os.Bundle saveState(SslCertificate c){return null;} }

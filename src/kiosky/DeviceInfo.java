@@ -1,13 +1,14 @@
 package kiosky;
 
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.PowerManager;
+import android.os.StatFs;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.DisplayMetrics;
@@ -24,6 +25,7 @@ import java.util.regex.Pattern;
 /** Facts about the tablet, for enrollment (§3.2) and check-in status (§4.1). */
 final class DeviceInfo {
 
+    private static final long MB = 1024L * 1024L;
     private static final long APP_START = SystemClock.elapsedRealtime();
     private static final Pattern CHROME = Pattern.compile("Chrome/([0-9.]+)");
 
@@ -66,12 +68,34 @@ final class DeviceInfo {
             // leave it out
         }
 
-        Intent battery = a.registerReceiver(null, new IntentFilter("android.intent.action.BATTERY_CHANGED"));
+        Intent battery = Battery.read(a);
         if (battery != null) {
-            int level = battery.getIntExtra("level", -1);
-            int scale = battery.getIntExtra("scale", -1);
-            if (level >= 0 && scale > 0) Json.put(s, "battery_level", Math.round(level * 100f / scale));
-            Json.put(s, "charging", battery.getIntExtra("plugged", 0) != 0);
+            int level = Battery.level(battery);
+            if (level >= 0) Json.put(s, "battery_level", level);
+            Json.put(s, "charging", Battery.charging(battery));
+            float t = Battery.temperature(battery);
+            if (!Float.isNaN(t)) Json.put(s, "battery_temperature", Math.round(t * 10) / 10.0);
+            Json.put(s, "battery_health", Battery.health(battery));
+        }
+
+        try {
+            StatFs fs = new StatFs(a.getFilesDir().getPath());
+            Json.put(s, "storage_free_mb", fs.getAvailableBytes() / MB);
+            Json.put(s, "storage_total_mb", fs.getTotalBytes() / MB);
+        } catch (Exception ignored) {
+            // leave it out
+        }
+        try {
+            ActivityManager am = (ActivityManager) a.getSystemService("activity");
+            ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
+            am.getMemoryInfo(mi);
+            Json.put(s, "memory_free_mb", mi.availMem / MB);
+            Json.put(s, "memory_total_mb", mi.totalMem / MB);
+            Json.put(s, "memory_low", mi.lowMemory);
+            Runtime rt = Runtime.getRuntime();
+            Json.put(s, "app_memory_mb", (rt.totalMemory() - rt.freeMemory()) / MB);
+        } catch (Exception ignored) {
+            // leave it out
         }
 
         if (userAgent != null) {

@@ -1,0 +1,1 @@
+package android.webkit; public abstract class PermissionRequest { public abstract android.net.Uri getOrigin(); public abstract String[] getResources(); public abstract void grant(String[] r); public abstract void deny(); }

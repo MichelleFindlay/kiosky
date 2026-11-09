@@ -4,11 +4,14 @@ import android.util.Base64;
 
 import org.json.JSONObject;
 
+import java.security.SecureRandom;
+
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
 /**
- * Checks a technician PIN against the server's PBKDF2-SHA256 hash (PROTOCOL.md §5.3).
+ * Checks a technician PIN against the server's PBKDF2-SHA256 hash (PROTOCOL.md §5.3),
+ * and hashes the local settings PIN the same way.
  *
  * PBKDF2 is computed here on HmacSHA256 rather than with SecretKeyFactory, because
  * "PBKDF2WithHmacSHA256" only exists from Android 8, and Kiosky supports Android 5.1.
@@ -31,6 +34,24 @@ final class Pin {
             return constantTimeEquals(actual, expected);
         } catch (Exception e) {
             return false;
+        }
+    }
+
+    /**
+     * Hashes a new PIN in the same format as the server's (for the local settings PIN
+     * on unmanaged tablets). Slow, like {@link #verify}.
+     */
+    static JSONObject create(String pin) {
+        try {
+            byte[] salt = new byte[16];
+            new SecureRandom().nextBytes(salt);
+            int iterations = 100000;
+            byte[] hash = pbkdf2(pin.getBytes("UTF-8"), salt, iterations, 32);
+            return Json.obj("algo", "pbkdf2-sha256", "iterations", iterations,
+                    "salt", Base64.encodeToString(salt, Base64.NO_WRAP),
+                    "hash", Base64.encodeToString(hash, Base64.NO_WRAP));
+        } catch (Exception e) {
+            return null;
         }
     }
 

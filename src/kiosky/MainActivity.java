@@ -17,26 +17,46 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.SystemClock;
 import android.util.Base64;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
+import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
+import android.net.http.SslError;
+import android.webkit.ConsoleMessage;
 import android.webkit.CookieManager;
+import android.webkit.HttpAuthHandler;
+import android.webkit.SslErrorHandler;
+import android.webkit.JavascriptInterface;
+import android.webkit.JsPromptResult;
+import android.webkit.JsResult;
+import android.webkit.PermissionRequest;
+import android.webkit.RenderProcessGoneDetail;
+import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebStorage;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
+import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.List;
 
 public class MainActivity extends Activity {
 
@@ -53,6 +73,19 @@ public class MainActivity extends Activity {
     private static final int REQ_SCAN = 42;
     private static final int MAX_PIN_TRIES = 5;
     private static final long PIN_LOCKOUT_MS = 5 * 60 * 1000L;
+    private static final int REQ_MEDIA = 43;
+    private static final int REQ_FILE = 44;
+    private static final String KEY_LAST_REBOOT = "last_reboot_day";
+    private static final String KEY_PIN = "settings_pin";          // local settings PIN (unmanaged)
+    private static final String KEY_MEDIA_HOSTS = "media_hosts";   // hosts allowed the camera/microphone
+    private static final long TICK_MS = 15000L;
+    private static final long MINUTE_MS = 60 * 1000L;
+    private static final int JS_DIALOG_SECONDS = 30;
+    private static final String RES_VIDEO = "android.webkit.resource.VIDEO_CAPTURE";
+    private static final String RES_AUDIO = "android.webkit.resource.AUDIO_CAPTURE";
+    private static final String PERM_CAMERA = "android.permission.CAMERA";
+    private static final String PERM_MIC = "android.permission.RECORD_AUDIO";
+    private static final int WAKE_FLAGS = 0x80000 | 0x200000 | 0x400000; // SHOW_WHEN_LOCKED | TURN_SCREEN_ON | DISMISS_KEYGUARD
 
     private final Handler handler = new Handler();
 
@@ -65,7 +98,7 @@ public class MainActivity extends Activity {
     private EditText urlField;
     private TextView mgmtStatus;
     private Button goButton, updateButton, bootToggle, enrollButton, infoButton, overlayButton, installButton;
-    private Button lockToggle, ownerButton;
+    private Button lockToggle, ownerButton, settingsButton;
 
     // Update bar
     private Updater updater;
@@ -89,11 +122,64 @@ public class MainActivity extends Activity {
     private int pinFails;
     private long pinLockedUntil;
     private View overlay;
+    private boolean pinPadOpen;
+    private Runnable afterUnlock;     // what the local PIN was asked for, if not the toolbar
+    private Options localOptions;     // unmanaged; managed tablets use policy.options
 
     // Page state, for status reports and events
     private String pageError;
     private boolean errorThisLoad;
     private String lastLoadedUrl, lastErrorKey;
+    private String errorUrl;          // the failing address and when, to tie an error to its load
+    private long errorAt;
+    private OfflineScreen offline;
+    private final long[] rendererGone = new long[3];
+
+    // Watchdog: a JavaScript heartbeat that a frozen page can't answer
+    private boolean heartbeatPending, watchdogReloaded;
+    private long heartbeatSentAt;
+    private int heartbeatGen;
+
+    // Idle, screen schedule and dimming
+    private long lastTouch, lastActivity, wakeUntil;   // SystemClock.elapsedRealtime()
+    private boolean swallowGesture, idleDimmed, scheduledOff;
+    private boolean manualOff;                        // window.kiosky.screenOff(): until a touch or wake
+    private float pageBrightness = -1f;               // window.kiosky.setBrightness(); -1: the tablet's own
+    private volatile String pageUrl;                  // for the page bridge, which runs on its own thread
+    private final Battery battery = new Battery();
+    private String batteryProtect = "off";
+    private int ticks;
+    /** restart_app: start clean instead of restoring the saved page. */
+    private static boolean freshStart;
+
+    private final Diagnostics diagnostics = new Diagnostics();
+    private Speaker speaker;
+    private ScreenSaver saver;
+    private ValueCallback<Uri[]> fileCallback;   // a page's file picker, while it's open
+    private int playlistIndex = -1;              // -1: the start page
+    private long liveUntil;                       // live_view running until (elapsedRealtime)
+    private int liveInterval, liveWidth, liveQuality;
+    private boolean liveSending;
+    private String authHost;                      // last HTTP sign-in we answered, to spot a refusal
+    private long authAt;
+    private boolean certDialogOpen;
+    private int appliedVolume = -2;               // -2: not applied yet
+    private int enrollTries;
+    private final long[] offTaps = new long[5];       // five quick taps always wake a switched-off screen
+    private int screenState = Options.NORMAL;
+    private View blackout;
+    private MotionWake motion;
+    private boolean landingHome, clearHistoryOnLoad;
+    private long landingUntil;
+    private String homeLanded;        // where the start page actually ended up (redirects, SPA routes)
+
+    // Camera and microphone, while Android's permission prompt is open
+    private PermissionRequest pendingMedia;
+    private String[] pendingGrant;
+
+    // Help, shown over the page so the page itself stays loaded
+    private LinearLayout helpBox;
+    private WebView helpView;
 
     private final Runnable autoCheck = new Runnable() {
         public void run() {
@@ -113,6 +199,62 @@ public class MainActivity extends Activity {
     private final Runnable retry = new Runnable() {
         public void run() {
             if (web != null) web.reload();
+        }
+    };
+
+    /** Every 15 s: screen schedule and dimming, going home when idle, the watchdog, the offline clock. */
+    private final Runnable tick = new Runnable() {
+        public void run() {
+            handler.removeCallbacks(tick);
+            updateScreen();
+            checkIdleHome();
+            watchdog();
+            if (offline.showing()) offline.tick();
+            if (ticks++ % 4 == 0) checkBattery(); // once a minute
+            saver.tick();
+            applyVolume();
+            checkReboot();
+            handler.postDelayed(tick, TICK_MS);
+        }
+    };
+
+    private final Runnable playlistNext = new Runnable() {
+        public void run() {
+            advancePlaylist();
+        }
+    };
+
+    private final Runnable liveFrame = new Runnable() {
+        public void run() {
+            sendLiveFrame();
+        }
+    };
+
+    private final Runnable pendingEnroll = new Runnable() {
+        public void run() {
+            tryPendingEnroll();
+        }
+    };
+
+    private final Runnable rebootNow = new Runnable() {
+        public void run() {
+            try {
+                Lockdown.dpm(MainActivity.this).reboot(admin());
+            } catch (Exception e) {
+                managed.addEvent("reboot_failed", Json.obj("message", String.valueOf(e)));
+            }
+        }
+    };
+
+    private final Runnable loadHomeLater = new Runnable() {
+        public void run() {
+            loadHome();
+        }
+    };
+
+    private final Runnable clearWakeFlags = new Runnable() {
+        public void run() {
+            if (screenState != Options.OFF) getWindow().clearFlags(WAKE_FLAGS);
         }
     };
 
@@ -149,7 +291,13 @@ public class MainActivity extends Activity {
     private final BroadcastReceiver network = new BroadcastReceiver() {
         @Override
         public void onReceive(Context c, Intent i) {
-            if (!i.getBooleanExtra("noConnectivity", false) && shepherd != null) shepherd.onNetworkBack();
+            if (!i.getBooleanExtra("noConnectivity", false) && shepherd != null) {
+                shepherd.onNetworkBack();
+                if (Provisioning.pending(c) != null) {
+                    handler.removeCallbacks(pendingEnroll);
+                    handler.postDelayed(pendingEnroll, 3000);
+                }
+            }
         }
     };
 
@@ -160,12 +308,30 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        Crashes.install(this);
         managed = new ManagedState(this);
+        JSONObject crash = Crashes.takePending(this);
+        if (crash != null) managed.addEvent("crash", crash);
         policy = managed.isManaged() ? Policy.parse(managed.policyJson()) : null;
         if (managed.isManaged() && policy == null) policy = new Policy(new JSONObject()); // locked defaults
+        localOptions = Options.local(this);
+        lastTouch = lastActivity = SystemClock.elapsedRealtime();
+        motion = new MotionWake(this, new MotionWake.Listener() {
+            public void onMotion(String source) {
+                if (options().wakeOnMotion) wakeScreen(options().wakeMinutes);
+            }
+        });
 
         root = new FrameLayout(this);
         buildWebView();
+        offline = new OfflineScreen(this, new Runnable() {
+            public void run() {
+                handler.removeCallbacks(retry);
+                if (web != null) web.reload();
+            }
+        });
+        root.addView(offline.view, new FrameLayout.LayoutParams(-1, -1));
+        saver = new ScreenSaver(this, root);
         buildCorner();
         buildUrlBar();
         buildUpdateBar();
@@ -184,6 +350,7 @@ public class MainActivity extends Activity {
 
         shepherd = new Shepherd(this, shepherdHost, managed);
         registerReceiver(network, new IntentFilter("android.net.conn.CONNECTIVITY_CHANGE"));
+        handler.postDelayed(pendingEnroll, 3000); // after QR provisioning: enroll once the network is up
 
         // Edge swipe reveals the system bars; show the toolbar alongside them
         getWindow().getDecorView().setOnSystemUiVisibilityChangeListener(
@@ -199,12 +366,14 @@ public class MainActivity extends Activity {
 
         applyPolicySettings();
 
-        if (state != null) {
+        if (state != null && !freshStart) {
             web.restoreState(state);
         } else {
             loadHome();
             handleIntent(getIntent());
         }
+
+        freshStart = false;
 
         if (policy != null) {
             managed.addEvent("app_started", null);
@@ -218,6 +387,7 @@ public class MainActivity extends Activity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        if (intent != null && intent.getBooleanExtra(ScheduleReceiver.EXTRA_WAKE, false)) updateScreen();
         handleIntent(intent);
     }
 
@@ -244,6 +414,8 @@ public class MainActivity extends Activity {
         goImmersive();
         if (web != null) web.onResume();
         handler.post(enforceLockdown); // once the activity is fully in front
+        heartbeatPending = false; // time spent paused isn't a frozen page
+        tick.run();
     }
 
     @Override
@@ -251,6 +423,7 @@ public class MainActivity extends Activity {
         resumed = false;
         setStatusBarBlocked(false); // Settings or an install prompt may need it
         statusBarBlocker.hide(this);
+        motion.stop();
         if (web != null) web.onPause();
         CookieManager.getInstance().flush();
         super.onPause();
@@ -264,12 +437,17 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        if (urlBar != null && urlBar.getVisibility() == 0) {
+        if (saver.showing() || screenState == Options.OFF) {
+            wakeScreen(options().wakeMinutes);
+        } else if (urlBar != null && urlBar.getVisibility() == 0) {
             dismissToolbar();
+        } else if (helpBox != null) {
+            closeHelp();
         } else if (web != null && web.canGoBack()) {
             web.goBack();
-        } else if (policy != null && !policy.allowExit) {
-            // Managed and not allowed to close: stay put
+        } else if ((policy != null && !policy.allowExit) || localPinSet() || lockdownWanted()) {
+            // Not allowed to close, protected by the settings PIN, or locked down (closing
+            // would end screen pinning and leave the tablet unlocked): stay put
         } else {
             super.onBackPressed();
         }
@@ -278,6 +456,12 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == REQ_FILE) {
+            ValueCallback<Uri[]> cb = fileCallback;
+            fileCallback = null;
+            if (cb != null) cb.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(result, data));
+            return;
+        }
         if (request != REQ_SCAN || result != -1 /* RESULT_OK */ || data == null) return;
         String text = data.getStringExtra("SCAN_RESULT");
         if (text != null && text.startsWith("kiosky://enroll")) {
@@ -287,9 +471,74 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * Every touch: counts as activity for idle dimming and going home, and wakes the
+     * screen. A touch that wakes a dimmed or switched-off screen doesn't reach the page.
+     */
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent e) {
+        int action = e.getActionMasked();
+        if (action == 0 /* DOWN */) {
+            long now = SystemClock.elapsedRealtime();
+            boolean asleep = screenState == Options.OFF || idleDimmed || saver.showing();
+            lastTouch = lastActivity = now;
+            manualOff = false;
+            Options o = options();
+            if (scheduledOff && o.wakeOnTouch) wakeUntil = now + o.wakeMinutes * MINUTE_MS;
+            if (screenState == Options.OFF && !o.wakeOnTouch) {
+                // Escape hatch when touch isn't meant to wake it: five quick taps still do
+                System.arraycopy(offTaps, 1, offTaps, 0, offTaps.length - 1);
+                offTaps[offTaps.length - 1] = now;
+                if (offTaps[0] != 0 && now - offTaps[0] <= 3000L) {
+                    for (int i = 0; i < offTaps.length; i++) offTaps[i] = 0;
+                    wakeUntil = now + o.wakeMinutes * MINUTE_MS;
+                }
+            }
+            swallowGesture = asleep;
+            if (asleep) updateScreen();
+        }
+        if (swallowGesture) {
+            if (action == 1 /* UP */ || action == 3 /* CANCEL */) swallowGesture = false;
+            return true;
+        }
+        return super.dispatchTouchEvent(e);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
+        if (request != REQ_MEDIA || pendingMedia == null) return;
+        PermissionRequest r = pendingMedia;
+        String[] wanted = pendingGrant;
+        pendingMedia = null;
+        pendingGrant = null;
+        List<String> grant = new ArrayList<String>();
+        for (String res : wanted) {
+            if (hasPermission(RES_VIDEO.equals(res) ? PERM_CAMERA : PERM_MIC)) grant.add(res);
+        }
+        if (grant.size() < wanted.length) {
+            managed.addEvent("media_denied", Json.obj("origin", String.valueOf(r.getOrigin()),
+                    "reason", "android_permission"));
+        }
+        if (grant.isEmpty()) r.deny();
+        else r.grant(grant.toArray(new String[0]));
+    }
+
     @Override
     protected void onDestroy() {
         handler.removeCallbacks(retry);
+        handler.removeCallbacks(tick);
+        handler.removeCallbacks(loadHomeLater);
+        handler.removeCallbacks(clearWakeFlags);
+        handler.removeCallbacks(playlistNext);
+        handler.removeCallbacks(liveFrame);
+        handler.removeCallbacks(pendingEnroll);
+        handler.removeCallbacks(rebootNow);
+        motion.stop();
+        closeHelp();
+        saver.hide();
+        if (speaker != null) speaker.shutdown();
+        if (fileCallback != null) fileCallback.onReceiveValue(null);
+        if (isFinishing()) ScheduleReceiver.cancel(this); // closed on purpose: don't reopen at on_at
         handler.removeCallbacks(autoHide);
         handler.removeCallbacks(autoCheck);
         handler.removeCallbacks(periodicReload);
@@ -325,8 +574,60 @@ public class MainActivity extends Activity {
         defaultUserAgent = s.getUserAgentString();
 
         CookieManager.getInstance().setAcceptCookie(true);
+        web.addJavascriptInterface(new Bridge(this), "kiosky");
 
-        web.setWebChromeClient(new WebChromeClient());
+        web.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onPermissionRequest(PermissionRequest r) {
+                mediaRequested(r);
+            }
+
+            @Override
+            public void onPermissionRequestCanceled(PermissionRequest r) {
+                if (r == pendingMedia) {
+                    pendingMedia = null;
+                    pendingGrant = null;
+                }
+            }
+
+            @Override
+            public boolean onJsAlert(WebView view, String url, String message, JsResult result) {
+                jsDialog("alert", message, null, result, null);
+                return true;
+            }
+
+            @Override
+            public boolean onJsConfirm(WebView view, String url, String message, JsResult result) {
+                jsDialog("confirm", message, null, result, null);
+                return true;
+            }
+
+            @Override
+            public boolean onJsPrompt(WebView view, String url, String message, String def, JsPromptResult result) {
+                jsDialog("prompt", message, def, result, result);
+                return true;
+            }
+
+            @Override
+            public boolean onConsoleMessage(ConsoleMessage m) {
+                ConsoleMessage.MessageLevel level = m == null ? null : m.messageLevel();
+                if (level == ConsoleMessage.MessageLevel.ERROR || level == ConsoleMessage.MessageLevel.WARNING) {
+                    diagnostics.console(level.name(), m.message(), m.sourceId(), m.lineNumber());
+                }
+                return false;
+            }
+
+            @Override
+            public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> cb, FileChooserParams params) {
+                return chooseFile(cb, params);
+            }
+
+            @Override
+            public boolean onJsBeforeUnload(WebView view, String url, String message, JsResult result) {
+                result.confirm(); // "Leave this page?" would block going home, reloads and the watchdog
+                return true;
+            }
+        });
         web.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, String url) {
@@ -339,7 +640,10 @@ public class MainActivity extends Activity {
 
             @Override
             public void onPageStarted(WebView view, String url, Bitmap favicon) {
-                errorThisLoad = false;
+                // An HTTP error arrives just before its page starts; a network error just after
+                boolean sameLoad = url != null && url.equals(errorUrl)
+                        && SystemClock.elapsedRealtime() - errorAt < 2000;
+                if (!sameLoad) errorThisLoad = false;
                 if (!allowed(url)) { // catches redirects that skip shouldOverrideUrlLoading
                     view.stopLoading();
                     blocked(url);
@@ -350,9 +654,21 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 CookieManager.getInstance().flush();
+                if (clearHistoryOnLoad) { // back from the start page shouldn't lead anywhere
+                    clearHistoryOnLoad = false;
+                    view.clearHistory();
+                }
                 if (errorThisLoad) return;
+                pageUrl = url;
+                handler.removeCallbacks(retry);
+                offline.hide();
                 pageError = null;
                 lastErrorKey = null;
+                if (landingHome) {
+                    landingHome = false;
+                    homeLanded = url;
+                    landingUntil = SystemClock.elapsedRealtime() + 10000; // in-page redirects (SPA routes)
+                }
                 if (url != null && !url.equals(lastLoadedUrl) && !isInternal(url)) {
                     lastLoadedUrl = url;
                     managed.addEvent("page_loaded", Json.obj("url", url, "title", view.getTitle()));
@@ -360,27 +676,385 @@ public class MainActivity extends Activity {
             }
 
             @Override
+            public void doUpdateVisitedHistory(WebView view, String url, boolean isReload) {
+                pageUrl = url;
+                if (url != null && SystemClock.elapsedRealtime() < landingUntil) homeLanded = url;
+            }
+
+            @Override
             public void onReceivedError(WebView view, int code, String desc, String url) {
-                errorThisLoad = true;
-                pageError = desc + " (" + code + ")";
-                String key = code + " " + url;
-                if (!key.equals(lastErrorKey)) { // once per failure, not on every retry
-                    lastErrorKey = key;
-                    lastLoadedUrl = null;
-                    managed.addEvent("page_error", Json.obj("code", code, "description", desc, "url", url));
-                }
                 // Server unreachable (Wi-Fi waking, server restarting): try again shortly
-                handler.removeCallbacks(retry);
-                handler.postDelayed(retry, policy != null ? policy.retrySeconds * 1000L : RETRY_MS);
+                pageFailed(code, desc + " (" + code + ")", desc, url, true);
+            }
+
+            @Override
+            public void onReceivedHttpError(WebView view, WebResourceRequest req, WebResourceResponse resp) {
+                if (req == null || resp == null || !req.isForMainFrame()) return;
+                int status = resp.getStatusCode();
+                String reason = resp.getReasonPhrase();
+                String text = "HTTP " + status + (reason != null && reason.length() > 0 ? " " + reason : "");
+                // 5xx: the server is restarting or overloaded (Home Assistant answers 502 while
+                // it starts). 408/429: try later. Other 4xx are real answers: leave them showing.
+                boolean retryable = status >= 500 || status == 408 || status == 429;
+                pageFailed(status, text, text, String.valueOf(req.getUrl()), retryable);
+            }
+
+            @Override
+            public void onReceivedHttpAuthRequest(WebView view, HttpAuthHandler h, String host, String realm) {
+                httpAuth(h, host, realm);
+            }
+
+            @Override
+            public void onReceivedSslError(WebView view, SslErrorHandler h, SslError error) {
+                sslError(h, error);
+            }
+
+            @Override
+            public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                // Without this, Android 8+ kills the whole app when the page's renderer dies
+                if (view != web) {
+                    destroyQuietly(view);
+                    return true;
+                }
+                rendererGone(detail != null && detail.didCrash());
+                return true;
             }
         });
-        root.addView(web, new FrameLayout.LayoutParams(-1, -1)); // MATCH_PARENT
+        root.addView(web, 0, new FrameLayout.LayoutParams(-1, -1)); // MATCH_PARENT, under everything else
+    }
+
+    /**
+     * The page couldn't load. {@code retryable}: cover it with the offline screen and
+     * keep trying; otherwise leave the server's answer showing.
+     */
+    private void pageFailed(int code, String status, String problem, String url, boolean retryable) {
+        errorThisLoad = true;
+        errorUrl = url;
+        errorAt = SystemClock.elapsedRealtime();
+        pageError = status;
+        String key = code + " " + url;
+        if (!key.equals(lastErrorKey)) { // once per failure, not on every retry
+            lastErrorKey = key;
+            lastLoadedUrl = null;
+            managed.addEvent("page_error", Json.obj("code", code, "description", status, "url", url));
+        }
+        if (!retryable) { // a real answer (404 and the like): show it, stop retrying
+            handler.removeCallbacks(retry);
+            offline.hide();
+            return;
+        }
+        int seconds = retrySeconds();
+        offline.show(Policy.host(url), problem, seconds);
+        handler.removeCallbacks(retry);
+        handler.postDelayed(retry, seconds * 1000L);
+    }
+
+    private int retrySeconds() {
+        return policy != null ? policy.retrySeconds : (int) (RETRY_MS / 1000);
+    }
+
+    /** The renderer crashed or was killed for memory: start again with a fresh WebView. */
+    private void rendererGone(boolean crashed) {
+        long now = SystemClock.elapsedRealtime();
+        System.arraycopy(rendererGone, 1, rendererGone, 0, rendererGone.length - 1);
+        rendererGone[rendererGone.length - 1] = now;
+        // Three times in five minutes: the page itself is probably the cause, so slow down
+        boolean looping = rendererGone[0] != 0 && now - rendererGone[0] < 5 * MINUTE_MS;
+        managed.addEvent("renderer_crashed", Json.obj("crashed", crashed, "url", lastLoadedUrl, "looping", looping));
+        rebuildWebView(looping ? MINUTE_MS : 0);
+    }
+
+    /** Replaces the WebView with a new one and loads the start page, after {@code delayMs}. */
+    private void rebuildWebView(long delayMs) {
+        WebView old = web;
+        web = null;
+        destroyQuietly(old);
+        buildWebView();
+        applyWebSettings();
+        heartbeatPending = false;
+        watchdogReloaded = false;
+        lastLoadedUrl = null;
+        handler.removeCallbacks(retry);
+        handler.removeCallbacks(loadHomeLater);
+        if (delayMs <= 0) {
+            loadHome();
+        } else {
+            offline.showText("The page keeps stopping. Kiosky will open it again in "
+                    + (delayMs / 1000) + " s.");
+            handler.postDelayed(loadHomeLater, delayMs);
+        }
+        web.requestFocus();
+    }
+
+    private void destroyQuietly(WebView v) {
+        if (v == null) return;
+        try {
+            root.removeView(v);
+            v.destroy();
+        } catch (Exception ignored) {
+            // already gone
+        }
+    }
+
+    /** {@code window.kiosky} for pages: lets a dashboard wake the screen (motion sensor automations). */
+    public static final class Bridge {
+        private final MainActivity a;
+
+        Bridge(MainActivity a) {
+            this.a = a;
+        }
+
+        @JavascriptInterface
+        public void wake() {
+            a.handler.post(new Runnable() {
+                public void run() {
+                    a.wakeScreen(a.options().wakeMinutes);
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public String version() {
+            return Updater.currentVersion(a);
+        }
+
+        /** Whether the screen is off (schedule or screenOff()). */
+        @JavascriptInterface
+        public boolean isScreenOff() {
+            return a.screenState == Options.OFF;
+        }
+
+        // The rest change the tablet, so only the kiosk's own trusted page may use them
+
+        @JavascriptInterface
+        public boolean reload() {
+            if (!a.trustedPage()) return false;
+            a.handler.post(new Runnable() {
+                public void run() {
+                    if (a.web != null) a.web.reload();
+                }
+            });
+            return true;
+        }
+
+        /** 1–100 percent until the page sets another value; 0 or less: the tablet's own brightness. */
+        @JavascriptInterface
+        public boolean setBrightness(final int percent) {
+            if (!a.trustedPage()) return false;
+            a.handler.post(new Runnable() {
+                public void run() {
+                    a.pageBrightness = percent <= 0 ? -1f : Json.clamp(percent, 1, 100) / 100f;
+                    a.updateScreen();
+                }
+            });
+            return true;
+        }
+
+        /** Black screen until the next touch, wake() or motion (if motion wakes it). */
+        @JavascriptInterface
+        public boolean screenOff() {
+            if (!a.trustedPage()) return false;
+            a.handler.post(new Runnable() {
+                public void run() {
+                    a.manualOff = true;
+                    a.updateScreen();
+                }
+            });
+            return true;
+        }
+
+        /** The name given in Shepherd, or "" when unmanaged or untrusted. */
+        @JavascriptInterface
+        public String deviceName() {
+            return a.trustedPage() && a.managed.isManaged() ? a.managed.name() : "";
+        }
+    }
+
+    /**
+     * The page now showing is the kiosk's own: managed, the start page's host, an
+     * allowed_hosts entry or an admin-sent page; unmanaged, the saved address's host.
+     * Any thread. Frames inside the page share window.kiosky, so this trusts the
+     * page's address, not the frame that calls.
+     */
+    boolean trustedPage() {
+        String url = pageUrl;
+        String host = Policy.host(url);
+        if (host == null || !url.regionMatches(true, 0, "https://", 0, 8)) return false;
+        Policy p = policy;
+        if (p != null) return p.trusted(url) || host.equals(tempHost);
+        return host.equals(Policy.host(savedUrl()));
+    }
+
+    // ======================================================================
+    // JavaScript dialogs
+    // ======================================================================
+
+    /**
+     * Shows a page's alert(), confirm() or prompt() and closes it by itself after
+     * 30 seconds (alert: OK, confirm and prompt: Cancel), so one stray dialog can't
+     * leave an unattended panel stuck.
+     */
+    private void jsDialog(final String type, String message, String def, final JsResult result,
+                          final JsPromptResult prompt) {
+        String text = message == null ? "" : message;
+        managed.addEvent("js_dialog", Json.obj("type", type,
+                "message", text.length() > 200 ? text.substring(0, 200) : text));
+        final boolean[] done = {false};
+        final AlertDialog[] shown = new AlertDialog[1];
+        final Runnable timeout = new Runnable() {
+            public void run() {
+                if (shown[0] != null) shown[0].dismiss();
+            }
+        };
+        final EditText field = prompt != null ? new EditText(this) : null;
+        if (field != null && def != null) field.setText(def);
+
+        AlertDialog.Builder b = dialog(new Runnable() {
+            public void run() {
+                handler.removeCallbacks(timeout);
+                if (done[0]) return;
+                done[0] = true;
+                if ("alert".equals(type)) result.confirm(); else result.cancel();
+            }
+        }).setTitle("The page says").setMessage(text);
+        if (field != null) b.setView(field);
+        b.setPositiveButton("OK", new DialogInterface.OnClickListener() {
+            public void onClick(DialogInterface d, int w) {
+                if (done[0]) return;
+                done[0] = true;
+                if (prompt != null) prompt.confirm(field.getText().toString()); else result.confirm();
+            }
+        });
+        if (!"alert".equals(type)) {
+            b.setNegativeButton("Cancel", new DialogInterface.OnClickListener() {
+                public void onClick(DialogInterface d, int w) {
+                    if (done[0]) return;
+                    done[0] = true;
+                    result.cancel();
+                }
+            });
+        }
+        shown[0] = b.show();
+        handler.postDelayed(timeout, JS_DIALOG_SECONDS * 1000L);
+    }
+
+    // ======================================================================
+    // Camera and microphone
+    // ======================================================================
+
+    /**
+     * A page asked for the camera or microphone (WebRTC doorbells, intercoms). Granted
+     * when the options allow it and the page is trusted: managed, the start page's host
+     * or an allowed_hosts entry; unmanaged, the start page's host or a host allowed once.
+     */
+    private void mediaRequested(final PermissionRequest r) {
+        Options o = options();
+        final String origin = String.valueOf(r.getOrigin());
+        final List<String> grant = new ArrayList<String>();
+        boolean media = false;
+        String[] res = r.getResources();
+        for (int i = 0; res != null && i < res.length; i++) {
+            if (RES_VIDEO.equals(res[i])) {
+                media = true;
+                if (o.camera) grant.add(res[i]);
+            } else if (RES_AUDIO.equals(res[i])) {
+                media = true;
+                if (o.microphone) grant.add(res[i]);
+            }
+        }
+        if (grant.isEmpty()) {
+            r.deny();
+            if (media) managed.addEvent("media_denied", Json.obj("origin", origin, "reason", "turned_off"));
+            return;
+        }
+        final String host = Policy.host(origin);
+        boolean https = origin.regionMatches(true, 0, "https://", 0, 8);
+        if (host == null || !https) {
+            r.deny();
+            return;
+        }
+        if (policy != null) {
+            if (policy.trusted(origin) || host.equals(tempHost)) {
+                grantMedia(r, grant);
+            } else {
+                r.deny();
+                managed.addEvent("media_denied", Json.obj("origin", origin, "reason", "host_not_allowed"));
+            }
+            return;
+        }
+        if (host.equals(Policy.host(savedUrl())) || mediaHosts().contains("," + host + ",")) {
+            grantMedia(r, grant);
+            return;
+        }
+        // Unmanaged and not the start page: ask once, and remember a yes
+        final boolean[] answered = {false};
+        String what = grant.size() == 2 ? "camera and microphone" : (RES_VIDEO.equals(grant.get(0)) ? "camera" : "microphone");
+        dialog(new Runnable() {
+            public void run() {
+                if (!answered[0]) r.deny();
+            }
+        })
+                .setTitle("Allow the " + what + "?")
+                .setMessage(host + " wants to use this tablet's " + what + ".")
+                .setPositiveButton("Allow", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) {
+                        answered[0] = true;
+                        getSharedPreferences(PREFS, 0).edit().putString(KEY_MEDIA_HOSTS, mediaHosts() + host + ",").apply();
+                        grantMedia(r, grant);
+                    }
+                })
+                .setNegativeButton("Block", null)
+                .show();
+    }
+
+    private String mediaHosts() {
+        String s = getSharedPreferences(PREFS, 0).getString(KEY_MEDIA_HOSTS, ",");
+        return s.startsWith(",") ? s : "," + s;
+    }
+
+    /** Grants once Android's own camera/microphone permissions are in place. */
+    private void grantMedia(PermissionRequest r, List<String> grant) {
+        List<String> missing = missingPermissions(grant);
+        if (!missing.isEmpty() && isDeviceOwner() && Build.VERSION.SDK_INT >= 23) {
+            for (String p : missing) {
+                try {
+                    Lockdown.dpm(this).setPermissionGrantState(admin(), getPackageName(), p, 1 /* GRANTED */);
+                } catch (Exception ignored) {
+                    // falls back to asking
+                }
+            }
+            missing = missingPermissions(grant);
+        }
+        if (missing.isEmpty()) {
+            r.grant(grant.toArray(new String[0]));
+            return;
+        }
+        if (pendingMedia != null) pendingMedia.deny();
+        pendingMedia = r;
+        pendingGrant = grant.toArray(new String[0]);
+        // Android's prompt is another app's window: don't treat it as leaving Kiosky
+        Lockdown.allowLeave(60 * 1000L);
+        Lockdown.quietUntil = System.currentTimeMillis() + 60 * 1000L;
+        requestPermissions(missing.toArray(new String[0]), REQ_MEDIA);
+    }
+
+    private List<String> missingPermissions(List<String> resources) {
+        List<String> missing = new ArrayList<String>();
+        for (String res : resources) {
+            String p = RES_VIDEO.equals(res) ? PERM_CAMERA : PERM_MIC;
+            if (!hasPermission(p) && !missing.contains(p)) missing.add(p);
+        }
+        return missing;
+    }
+
+    private boolean hasPermission(String p) {
+        return Build.VERSION.SDK_INT < 23 || checkSelfPermission(p) == 0 /* GRANTED */;
     }
 
     /**
      * Five quick taps in the top-left corner open the technician PIN pad (§5.3), or,
-     * on an unmanaged tablet in lockdown, Kiosky's menu. A fallback in case an edge
-     * swipe can't reveal the system bars while the tablet is locked down.
+     * on an unmanaged tablet in lockdown, Kiosky's menu (after the settings PIN, if
+     * set). A fallback in case an edge swipe can't reveal the system bars while locked down.
      */
     private void buildCorner() {
         int size = (int) (48 * getResources().getDisplayMetrics().density);
@@ -393,7 +1067,7 @@ public class MainActivity extends Activity {
                 cornerTaps[cornerTaps.length - 1] = now;
                 if (now - cornerTaps[0] <= 3000L) {
                     for (int i = 0; i < cornerTaps.length; i++) cornerTaps[i] = 0;
-                    if (policy == null) showUrlBar(); // unmanaged lockdown: straight to the menu
+                    if (policy == null) showUrlBar(); // unmanaged: the menu (after the settings PIN, if set)
                     else showPinPad();
                 }
             }
@@ -455,8 +1129,13 @@ public class MainActivity extends Activity {
         });
         button("Help", new Runnable() {
             public void run() {
-                showHelp(); // view only; the saved address stays as it is
+                showHelpOverlay(); // over the page, which stays loaded underneath
                 dismissToolbar();
+            }
+        });
+        settingsButton = button("Settings", new Runnable() {
+            public void run() {
+                showSettingsForm(null);
             }
         });
         updateButton = button("Update", new Runnable() {
@@ -577,12 +1256,19 @@ public class MainActivity extends Activity {
     private void loadHome() {
         tempHost = null;
         onTemporaryPage = false;
+        landingHome = true;
+        clearHistoryOnLoad = true;
+        homeLanded = null;
+        handler.removeCallbacks(loadHomeLater);
+        playlistIndex = -1;
+        schedulePlaylist();
         open(homeUrl());
     }
 
     private void open(String url) {
         if (Pages.HELP_URL.equals(url)) {
-            showHelp();
+            // No address set yet: the help page is the start page
+            web.loadDataWithBaseURL(Pages.HELP_URL, Pages.help(this, true), "text/html", "utf-8", Pages.HELP_URL);
         } else if (Pages.WAITING_URL.equals(url)) {
             String org = policy != null ? policy.organisation : "your organisation";
             web.loadDataWithBaseURL(Pages.WAITING_URL, Pages.waiting(org, managed.name()),
@@ -592,9 +1278,75 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void showHelp() {
+    /**
+     * Shows the help page over the kiosk page in its own WebView, so opening help
+     * never navigates away from the page that was set. Close or Back returns to it.
+     */
+    private void showHelpOverlay() {
+        if (helpBox != null) return;
+        float d = getResources().getDisplayMetrics().density;
+        int pad = (int) (8 * d);
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(1 /* VERTICAL */);
+        box.setBackgroundColor(0xFF1C1C1E);
+
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(0 /* HORIZONTAL */);
+        bar.setGravity(16 /* CENTER_VERTICAL */);
+        bar.setPadding(pad * 2, pad, pad, pad);
+        TextView title = new TextView(this);
+        title.setText("Kiosky help");
+        title.setTextColor(0xFFFFFFFF);
+        title.setTextSize(18);
+        bar.addView(title, new LinearLayout.LayoutParams(0, -2, 1f));
+        Button close = new Button(this);
+        close.setText("Close");
+        close.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                closeHelp();
+            }
+        });
+        bar.addView(close, new LinearLayout.LayoutParams(-2, -2));
+        box.addView(bar, new LinearLayout.LayoutParams(-1, -2));
+
+        WebView hv = new WebView(this);
+        hv.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                if (url != null && url.startsWith(Pages.HELP_URL + "#")) return false;
+                toast("Open " + url + " on another device"); // help never leads off the tablet's page
+                return true;
+            }
+
+            @Override
+            public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                closeHelp(); // shares the renderer with the page, which rebuilds itself
+                return true;
+            }
+        });
         // WebView can't display Markdown, so it's converted to HTML first
-        web.loadDataWithBaseURL(Pages.HELP_URL, Pages.help(this), "text/html", "utf-8", Pages.HELP_URL);
+        hv.loadDataWithBaseURL(Pages.HELP_URL, Pages.help(this, false), "text/html", "utf-8", null);
+        box.addView(hv, new LinearLayout.LayoutParams(-1, 0, 1f));
+
+        helpBox = box;
+        helpView = hv;
+        root.addView(box, new FrameLayout.LayoutParams(-1, -1));
+    }
+
+    private void closeHelp() {
+        if (helpBox == null) return;
+        LinearLayout box = helpBox;
+        WebView hv = helpView;
+        helpBox = null;
+        helpView = null;
+        root.removeView(box);
+        try {
+            hv.destroy();
+        } catch (Exception ignored) {
+            // already gone
+        }
+        if (web != null) web.requestFocus();
     }
 
     private static boolean isInternal(String url) {
@@ -660,6 +1412,7 @@ public class MainActivity extends Activity {
         show(updateButton, !isManaged);
         show(bootToggle, !isManaged);
         show(enrollButton, !isManaged);
+        show(settingsButton, !isManaged); // managed: these come from the server
         show(infoButton, isManaged && unlocked);
         boolean owner = isDeviceOwner();
         // Managed: the policy decides; after the technician PIN the checklist can still be opened
@@ -692,6 +1445,11 @@ public class MainActivity extends Activity {
 
     private void showUrlBar() {
         if (!toolbarAllowed()) return; // managed "hidden": the system bars show, the toolbar doesn't
+        if (screenState == Options.OFF) return;
+        if (localPinSet() && !unlocked) {
+            showPinPad();
+            return;
+        }
         refreshToolbar();
         if (policy == null) {
             urlField.setText(savedUrl());
@@ -734,12 +1492,7 @@ public class MainActivity extends Activity {
     /** Applies every setting that doesn't involve navigating. */
     private void applyPolicySettings() {
         Policy p = policy;
-        WebSettings s = web.getSettings();
-        s.setTextZoom(p != null ? p.textZoom : 100);
-        s.setUserAgentString(p != null && p.userAgentSuffix.length() > 0
-                ? defaultUserAgent + " " + p.userAgentSuffix : defaultUserAgent);
-        s.setMediaPlaybackRequiresUserGesture(p != null && !p.autoplayMedia);
-        CookieManager.getInstance().setAcceptThirdPartyCookies(web, p == null || p.thirdPartyCookies);
+        applyWebSettings();
         applyScreenOn();
         setRequestedOrientation(p != null ? p.orientationCode() : -1);
 
@@ -748,10 +1501,32 @@ public class MainActivity extends Activity {
 
         handler.removeCallbacks(periodicReload);
         if (p != null && p.reloadMinutes > 0) handler.postDelayed(periodicReload, p.reloadMinutes * 60000L);
+        updateScreen();
+        if (managed != null) checkBattery();
+        appliedVolume = -2;
+        applyVolume();
+        schedulePlaylist();
+    }
+
+    /** The WebView's own settings; re-applied when the WebView is rebuilt. */
+    private void applyWebSettings() {
+        Policy p = policy;
+        WebSettings s = web.getSettings();
+        s.setTextZoom(p != null ? p.textZoom : 100);
+        s.setUserAgentString(p != null && p.userAgentSuffix.length() > 0
+                ? defaultUserAgent + " " + p.userAgentSuffix : defaultUserAgent);
+        s.setMediaPlaybackRequiresUserGesture(p != null && !p.autoplayMedia);
+        CookieManager.getInstance().setAcceptThirdPartyCookies(web, p == null || p.thirdPartyCookies);
+    }
+
+    private Options options() {
+        return policy != null ? policy.options : localOptions;
     }
 
     private void applyScreenOn() {
-        boolean on = policy == null || policy.keepScreenOn;
+        // Fully off for the night (nothing can wake it): let Android switch the screen off
+        boolean asleep = screenState == Options.OFF && !options().wakeable() && !manualOff;
+        boolean on = (policy == null || policy.keepScreenOn) && !asleep;
         // Window flag plus view flag, so it holds even if one of them is replaced
         if (on) getWindow().addFlags(128 /* FLAG_KEEP_SCREEN_ON */);
         else getWindow().clearFlags(128);
@@ -768,6 +1543,18 @@ public class MainActivity extends Activity {
             Json.put(s, "lockdown_mode", Lockdown.mode(MainActivity.this));
             Json.put(s, "accessibility_helper", KioskAccessibility.running());
             Json.put(s, "default_home", Lockdown.isDefaultHome(MainActivity.this));
+            Options o = options();
+            if (o.hasSchedule()) Json.put(s, "screen_schedule", scheduledOff ? "off" : "on");
+            Json.put(s, "screen_state", screenState == Options.OFF ? "off" : (screenState == Options.DIM ? "dim" : "normal"));
+            Json.put(s, "camera_permission", hasPermission(PERM_CAMERA));
+            Json.put(s, "microphone_permission", hasPermission(PERM_MIC));
+            Json.put(s, "offline_screen", offline.showing());
+            Json.put(s, "battery_full_hours", battery.fullHours());
+            Json.put(s, "battery_protect", batteryProtect);
+            Json.put(s, "screensaver", saver.showing());
+            Json.put(s, "reboot_supported", canReboot());
+            Json.put(s, "volume_percent", volumePercent());
+            if (options().playlistUrls.length > 0) Json.put(s, "playlist_index", playlistIndex);
             return s;
         }
 
@@ -794,6 +1581,7 @@ public class MainActivity extends Activity {
         }
 
         public void restartApp() {
+            freshStart = true; // a restart should clear a stuck page, not bring it back
             recreate();
         }
 
@@ -803,18 +1591,22 @@ public class MainActivity extends Activity {
             SharedPreferences.Editor ed = getSharedPreferences(PREFS, 0).edit();
             if (last != null && last.url.length() > 0) ed.putString(KEY_URL, last.url);
             if (last != null) ed.putBoolean(KEY_BOOT, last.startOnBoot);
+            if (last != null) ed.putString(Options.PREF, last.options.toJson().toString());
             ed.putBoolean(KEY_LOCKDOWN, last != null && last.lockdown); // stays as it was
             ed.apply();
             boolean waiting = Pages.WAITING_URL.equals(web.getUrl()) || (last != null && last.url.length() == 0);
             policy = null;
             unlocked = false;
             tempHost = null;
+            localOptions = last != null ? last.options : Options.local(MainActivity.this);
             applyPolicySettings();
             if (waiting) loadHome();
             showOverlay("This tablet is no longer managed by " + org, 8, false);
         }
 
         public void onEnrolled(Policy p, String name) {
+            Provisioning.clear(MainActivity.this);
+            handler.removeCallbacks(pendingEnroll);
             boolean wasLocked = lockdownWanted();
             policy = p;
             applyPolicySettings();
@@ -839,7 +1631,42 @@ public class MainActivity extends Activity {
         if ("reload".equals(type)) {
             web.reload();
         } else if ("go_home".equals(type)) {
+            closeHelp();
             loadHome();
+        } else if ("live_view".equals(type)) {
+            int seconds = Json.clamp(params.optInt("seconds", 120), 0, 600);
+            handler.removeCallbacks(liveFrame);
+            if (seconds == 0) {
+                liveUntil = 0;
+            } else {
+                liveUntil = SystemClock.elapsedRealtime() + seconds * 1000L;
+                liveInterval = Json.clamp(params.optInt("interval", 2), 1, 10);
+                liveWidth = Json.clamp(params.optInt("max_width", 960), 64, 1920);
+                liveQuality = Json.clamp(params.optInt("quality", 60), 10, 100);
+                handler.postDelayed(liveFrame, 500); // after this result is on its way
+            }
+        } else if ("diagnostics".equals(type)) {
+            try {
+                String bundle = diagnostics.bundle(this, shepherdHost.status(), managed.appliedVersion(),
+                        Json.clamp(params.optInt("lines", 2000), 100, 10000));
+                if (bundle.length() > 13 * 1024 * 1024) return failed("the diagnostics bundle is over 10 MB");
+                return Json.obj("status", "done", "bundle", bundle);
+            } catch (Exception e) {
+                return failed("couldn't collect diagnostics: " + e);
+            }
+        } else if ("announce".equals(type)) {
+            String text = Json.str(params, "text", "").trim();
+            if (text.length() == 0) return failed("no text");
+            if (speaker == null) speaker = new Speaker(this);
+            if (!speaker.say(text, params.has("volume") ? Json.clamp(params.optInt("volume", -1), 0, 100) : -1)) {
+                return failed("this tablet has no text-to-speech engine");
+            }
+        } else if ("reboot".equals(type)) {
+            if (!canReboot()) return failed("rebooting needs Kiosky to be the device owner, on Android 7 or later");
+            handler.postDelayed(rebootNow, 8000); // time for this result to reach the server
+        } else if ("wake_screen".equals(type)) {
+            int minutes = params == null ? 0 : params.optInt("minutes", 0);
+            wakeScreen(minutes > 0 ? Json.clamp(minutes, 1, 240) : options().wakeMinutes);
         } else if ("navigate".equals(type)) {
             String url = Json.str(params, "url", "");
             if (!url.startsWith("https://")) return failed("url must start with https://");
@@ -879,11 +1706,12 @@ public class MainActivity extends Activity {
         return Json.obj("status", "failed", "message", message);
     }
 
+    /** What's on screen: the page plus anything over it (offline screen, help, screensaver). */
     private JSONObject screenshot(int maxWidth, int quality) {
-        int w = web.getWidth(), h = web.getHeight();
+        int w = root.getWidth(), h = root.getHeight();
         if (w <= 0 || h <= 0) return failed("the page isn't on screen");
         Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-        web.draw(new Canvas(bmp));
+        root.draw(new Canvas(bmp));
         if (w > maxWidth) {
             Bitmap scaled = Bitmap.createScaledBitmap(bmp, maxWidth, Math.max(1, h * maxWidth / w), true);
             bmp.recycle();
@@ -943,6 +1771,772 @@ public class MainActivity extends Activity {
         overlay = box;
         root.addView(box, new FrameLayout.LayoutParams(-1, -1));
         handler.postDelayed(remove, seconds * 1000L);
+    }
+
+    // ======================================================================
+    // Playlist, live view, volume, reboots and provisioning
+    // ======================================================================
+
+    private void schedulePlaylist() {
+        handler.removeCallbacks(playlistNext);
+        Options o = options();
+        if (o.playlistUrls.length > 0) handler.postDelayed(playlistNext, o.playlistSeconds * 1000L);
+    }
+
+    /** Next page of the playlist: the start page, then each playlist page in turn. */
+    private void advancePlaylist() {
+        Options o = options();
+        String[] urls = o.playlistUrls;
+        if (urls.length == 0 || web == null) return;
+        long sinceTouch = SystemClock.elapsedRealtime() - lastTouch;
+        long pause = o.playlistPauseSeconds * 1000L;
+        if (pause > 0 && sinceTouch < pause) { // someone is using it: carry on later from here
+            handler.removeCallbacks(playlistNext);
+            handler.postDelayed(playlistNext, pause - sinceTouch + 500);
+            return;
+        }
+        if (offline.showing() || screenState == Options.OFF || helpBox != null || onTemporaryPage) {
+            schedulePlaylist();
+            return;
+        }
+        playlistIndex = playlistIndex + 1 >= urls.length ? -1 : playlistIndex + 1;
+        clearHistoryOnLoad = true;
+        if (playlistIndex < 0) open(homeUrl());
+        else web.loadUrl(urls[playlistIndex]);
+        schedulePlaylist();
+    }
+
+    private void sendLiveFrame() {
+        if (policy == null || SystemClock.elapsedRealtime() > liveUntil) return;
+        handler.postDelayed(liveFrame, liveInterval * 1000L);
+        if (liveSending) return; // the last frame is still on its way: skip one
+        JSONObject shot = screenshot(liveWidth, liveQuality);
+        String b64 = Json.str(shot, "screenshot", null);
+        if (b64 == null) return;
+        liveSending = true;
+        shepherd.sendLiveFrame(b64, new Shepherd.FrameSent() {
+            public void onSent(int code) {
+                liveSending = false;
+                if (code >= 400 && code < 500) { // the server wants no more (§7)
+                    liveUntil = 0;
+                    handler.removeCallbacks(liveFrame);
+                }
+            }
+        });
+    }
+
+    /** audio.volume and quiet hours: only when the wanted level changes, so a hand-set level holds until then. */
+    private void applyVolume() {
+        int want = options().volumeNow(Calendar.getInstance());
+        if (want == appliedVolume) return;
+        appliedVolume = want;
+        if (want >= 0) Speaker.Volume.setPercent(this, want);
+    }
+
+    private int volumePercent() {
+        try {
+            android.media.AudioManager am = (android.media.AudioManager) getSystemService("audio");
+            int max = am.getStreamMaxVolume(3);
+            return max > 0 ? Math.round(am.getStreamVolume(3) * 100f / max) : -1;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    private boolean canReboot() {
+        return isDeviceOwner() && Build.VERSION.SDK_INT >= 24;
+    }
+
+    /** reboot_at: once a day, a full reboot as device owner, otherwise a fresh restart of Kiosky. */
+    private void checkReboot() {
+        Options o = options();
+        if (o.rebootAt < 0) return;
+        Calendar now = Calendar.getInstance();
+        if (now.get(Calendar.HOUR_OF_DAY) * 60 + now.get(Calendar.MINUTE) != o.rebootAt) return;
+        String today = now.get(Calendar.YEAR) + "-" + now.get(Calendar.DAY_OF_YEAR);
+        SharedPreferences prefs = getSharedPreferences(PREFS, 0);
+        if (today.equals(prefs.getString(KEY_LAST_REBOOT, null))) return;
+        if (SystemClock.elapsedRealtime() < 30 * MINUTE_MS) return; // just started: that's fresh enough
+        prefs.edit().putString(KEY_LAST_REBOOT, today).commit();
+        if (canReboot()) {
+            managed.addEvent("rebooting", Json.obj("reason", "reboot_at"));
+            shepherd.checkinSoon(); // deliver the event before going down
+            handler.postDelayed(rebootNow, 10000);
+        } else {
+            managed.addEvent("restarting", Json.obj("reason", "reboot_at"));
+            freshStart = true;
+            recreate();
+        }
+    }
+
+    /** After QR provisioning: enroll with the server and code it carried, no questions asked. */
+    private void tryPendingEnroll() {
+        handler.removeCallbacks(pendingEnroll);
+        JSONObject p = Provisioning.pending(this);
+        if (p == null) return;
+        if (managed.isManaged()) {
+            Provisioning.clear(this);
+            return;
+        }
+        if (enrollTries++ >= 60) return; // a code that never works; the next start tries again
+        shepherd.enroll(Json.str(p, "server", ""), Json.str(p, "token", ""));
+        handler.postDelayed(pendingEnroll, MINUTE_MS); // cancelled by onEnrolled
+    }
+
+    // ======================================================================
+    // File uploads, HTTP sign-in and certificates
+    // ======================================================================
+
+    private boolean chooseFile(ValueCallback<Uri[]> cb, WebChromeClient.FileChooserParams params) {
+        if (!options().fileUploads) {
+            cb.onReceiveValue(null);
+            toast("File uploads are turned off on this tablet");
+            return true;
+        }
+        if (fileCallback != null) fileCallback.onReceiveValue(null);
+        fileCallback = cb;
+        try {
+            // The picker is another app: don't pull Kiosky back over it, but don't unlock either
+            Lockdown.allowLeave(2 * MINUTE_MS);
+            startActivityForResult(params.createIntent(), REQ_FILE);
+        } catch (Exception e) {
+            fileCallback = null;
+            cb.onReceiveValue(null);
+            toast("No app on this tablet can pick files");
+        }
+        return true;
+    }
+
+    /** A page wants a username and password (HTTP basic auth). */
+    private void httpAuth(final HttpAuthHandler h, final String host, String realm) {
+        long now = SystemClock.elapsedRealtime();
+        boolean refused = host != null && host.equals(authHost) && now - authAt < 15000; // asked again straight away
+        authHost = host;
+        authAt = now;
+        if (host == null) {
+            h.cancel();
+            return;
+        }
+        if (policy != null) {
+            String want = policy.httpAuthHost.length() > 0 ? policy.httpAuthHost : Policy.host(policy.url);
+            if (!refused && host.equalsIgnoreCase(want) && policy.httpAuthUser.length() > 0) {
+                h.proceed(policy.httpAuthUser, policy.httpAuthPassword);
+                return;
+            }
+            h.cancel();
+            pageError = refused ? "HTTP sign-in refused for " + host : "HTTP sign-in needed for " + host;
+            managed.addEvent("page_error", Json.obj("code", 401, "description", pageError, "url", host));
+            return;
+        }
+        JSONObject saved = Trust.localAuth(this, host);
+        if (saved != null && !refused) {
+            h.proceed(Json.str(saved, "username", ""), Json.str(saved, "password", ""));
+            return;
+        }
+        float d = getResources().getDisplayMetrics().density;
+        int pad = (int) (20 * d);
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(1 /* VERTICAL */);
+        form.setPadding(pad, pad / 2, pad, 0);
+        final EditText user = new EditText(this);
+        user.setSingleLine(true);
+        user.setHint("Username");
+        if (saved != null) user.setText(Json.str(saved, "username", ""));
+        form.addView(user, new LinearLayout.LayoutParams(-1, -2));
+        final EditText pass = new EditText(this);
+        pass.setSingleLine(true);
+        pass.setInputType(0x81 /* TEXT | TEXT_VARIATION_PASSWORD */);
+        pass.setHint("Password");
+        form.addView(pass, new LinearLayout.LayoutParams(-1, -2));
+        final CheckBox remember = check(form, "Remember on this tablet", true);
+        final boolean[] answered = {false};
+        dialog(new Runnable() {
+            public void run() {
+                if (!answered[0]) h.cancel();
+            }
+        })
+                .setTitle("Sign in to " + host)
+                .setMessage((refused ? "That didn't work. " : "") + (realm != null && realm.length() > 0 ? realm : ""))
+                .setView(form)
+                .setPositiveButton("Sign in", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dlg, int which) {
+                        answered[0] = true;
+                        if (remember.isChecked()) Trust.saveLocalAuth(MainActivity.this, host, text(user), text(pass));
+                        h.proceed(text(user), text(pass));
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /**
+     * A certificate Android doesn't trust (self-signed, private CA, expired…). Allowed
+     * only by its SHA-256 fingerprint: managed, listed in trusted_certificates and on a
+     * trusted host; unmanaged, confirmed once for this host.
+     */
+    private void sslError(final SslErrorHandler h, SslError e) {
+        final String url = e == null ? null : e.getUrl();
+        final String host = Policy.host(url);
+        final String fp = e == null ? null : Trust.fingerprint(e.getCertificate());
+        if (host == null || fp == null) {
+            h.cancel();
+            return;
+        }
+        if (policy != null) {
+            if (policy.trustsCertificate(fp) && (policy.trusted(url) || host.equals(tempHost))) {
+                h.proceed();
+                return;
+            }
+            h.cancel();
+            untrustedCertificate(url, host, fp, e.getPrimaryError());
+            return;
+        }
+        if (Trust.localCert(this, host, fp)) {
+            h.proceed();
+            return;
+        }
+        if (certDialogOpen) { // one question at a time; the rest of the page's requests wait for a reload
+            h.cancel();
+            return;
+        }
+        certDialogOpen = true;
+        final boolean[] answered = {false};
+        dialog(new Runnable() {
+            public void run() {
+                certDialogOpen = false;
+                if (!answered[0]) {
+                    h.cancel();
+                    untrustedCertificate(url, host, fp, -1);
+                }
+            }
+        })
+                .setTitle("Trust " + host + "?")
+                .setMessage(host + "'s certificate isn't trusted by Android. That's normal for a server on your own "
+                        + "network with a self-signed certificate (Home Assistant, a NAS…), and a warning sign anywhere else.\n\n"
+                        + "SHA-256 fingerprint:\n" + Trust.pretty(fp) + "\n\nOnly trust it if this is your own server.")
+                .setPositiveButton("Trust", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dlg, int which) {
+                        answered[0] = true;
+                        Trust.addLocalCert(MainActivity.this, host, fp);
+                        h.proceed();
+                    }
+                })
+                .setNegativeButton("Don't trust", null)
+                .show();
+    }
+
+    private void untrustedCertificate(String url, String host, String fp, int error) {
+        // Sub-resources (an image from another site) don't take over the screen; the page's own site does
+        boolean page = host.equals(Policy.host(homeUrl())) || host.equals(Policy.host(web.getUrl()));
+        if (!page) {
+            managed.addEvent("certificate_untrusted", Json.obj("url", url, "host", host,
+                    "fingerprint", Trust.pretty(fp), "error", error, "subresource", true));
+            return;
+        }
+        errorThisLoad = true;
+        errorUrl = url;
+        errorAt = SystemClock.elapsedRealtime();
+        pageError = "untrusted certificate for " + host;
+        String key = "cert " + host + fp;
+        if (!key.equals(lastErrorKey)) {
+            lastErrorKey = key;
+            // The fingerprint goes to the server so an admin can copy it into trusted_certificates
+            managed.addEvent("certificate_untrusted", Json.obj("url", url, "host", host,
+                    "fingerprint", Trust.pretty(fp), "error", error));
+        }
+        offline.showText(host + "'s certificate isn't trusted.\nSHA-256 " + Trust.pretty(fp)
+                + (policy != null ? "\nAdd it to Trusted certificates in Kiosky Shepherd." : ""));
+    }
+
+    // ======================================================================
+    // Screen schedule, dimming and waking (policy "screen", or local Settings)
+    // ======================================================================
+
+    /**
+     * Works out what the screen should be doing now and applies it. Off: a black
+     * overlay at zero brightness, kept on so a touch or motion can wake it; or, when
+     * nothing may wake it, actually off (Android's timeout, or lockNow as device owner)
+     * with an alarm to switch it back on at {@code on_at}.
+     */
+    private void updateScreen() {
+        if (root == null || motion == null) return;
+        Options o = options();
+        long now = SystemClock.elapsedRealtime();
+        int sched = o.scheduled(Calendar.getInstance());
+        boolean off = sched == Options.OFF;
+        if (scheduledOff && !off) { // the off hours just ended
+            wakeUntil = 0;
+            lastTouch = lastActivity = now; // don't dim or go home straight away
+            managed.addEvent("screen_schedule", Json.obj("state", "on"));
+            if (web != null && !offline.showing()) web.reload(); // fresh after a night's sleep
+        } else if (!scheduledOff && off) {
+            managed.addEvent("screen_schedule", Json.obj("state", "off"));
+        }
+        scheduledOff = off;
+
+        boolean idle = o.idleDimMinutes > 0 && now - lastActivity >= o.idleDimMinutes * MINUTE_MS;
+        idleDimmed = idle && sched == Options.NORMAL;
+        int state = manualOff || (off && now >= wakeUntil) ? Options.OFF
+                : (sched == Options.DIM || idleDimmed ? Options.DIM : Options.NORMAL);
+        boolean changed = state != screenState;
+        screenState = state;
+
+        setBrightness(state == Options.OFF ? 0f : (state == Options.DIM ? o.dimBrightness / 100f : pageBrightness));
+        if (state == Options.OFF && blackout == null) {
+            blackout = new View(this);
+            blackout.setBackgroundColor(0xFF000000);
+            root.addView(blackout, new FrameLayout.LayoutParams(-1, -1));
+        } else if (state != Options.OFF && blackout != null) {
+            root.removeView(blackout);
+            blackout = null;
+        }
+        applyScreenOn();
+
+        boolean saverWanted = o.screensaverMinutes > 0 && state != Options.OFF && helpBox == null
+                && !offline.showing() && now - lastActivity >= o.screensaverMinutes * MINUTE_MS;
+        if (saverWanted && !saver.showing()) {
+            saver.show(o.screensaverUrl);
+            managed.addEvent("screensaver", Json.obj("state", "on"));
+        } else if (!saverWanted && saver.showing()) {
+            saver.hide();
+        }
+
+        if (o.wakeOnMotion && resumed && (o.hasSchedule() || o.idleDimMinutes > 0 || o.screensaverMinutes > 0)) motion.start();
+        else motion.stop();
+
+        if (!changed) return;
+        if (state == Options.OFF) {
+            dismissToolbar();
+            if (!o.wakeable() && !manualOff) {
+                getWindow().addFlags(WAKE_FLAGS); // so the alarm can bring it back over the lock screen
+                handler.removeCallbacks(clearWakeFlags);
+                ScheduleReceiver.set(this, o.nextOnAt(Calendar.getInstance()));
+                if (isDeviceOwner()) {
+                    try {
+                        Lockdown.dpm(this).lockNow();
+                    } catch (Exception ignored) {
+                        // Android's screen timeout switches it off instead
+                    }
+                }
+            }
+        } else {
+            ScheduleReceiver.cancel(this);
+            handler.removeCallbacks(clearWakeFlags);
+            handler.postDelayed(clearWakeFlags, MINUTE_MS);
+        }
+    }
+
+    /** Once a minute: battery temperature events and the charging limit. */
+    private void checkBattery() {
+        Intent b = Battery.read(this);
+        String change = battery.check(b);
+        if (change != null) {
+            managed.addEvent(change.equals("hot") ? "battery_hot" : "battery_cool",
+                    Json.obj("temperature", Battery.temperature(b), "level", Battery.level(b),
+                            "charging", Battery.charging(b)));
+        }
+        String was = batteryProtect;
+        batteryProtect = Battery.applyProtect(this, options().batteryProtect);
+        if (!batteryProtect.equals(was) && !"off".equals(batteryProtect)) {
+            managed.addEvent("battery_protect", Json.obj("state", batteryProtect));
+        }
+    }
+
+    private void setBrightness(float value) {
+        WindowManager.LayoutParams lp = getWindow().getAttributes();
+        if (lp == null || lp.screenBrightness == value) return;
+        lp.screenBrightness = value; // -1: the tablet's own brightness
+        getWindow().setAttributes(lp);
+    }
+
+    /** Someone is there (motion, a page, a server command): wake for a while if it's off. */
+    private void wakeScreen(int minutes) {
+        long now = SystemClock.elapsedRealtime();
+        lastActivity = now;
+        manualOff = false;
+        if (scheduledOff) wakeUntil = now + minutes * MINUTE_MS;
+        updateScreen();
+    }
+
+    // ======================================================================
+    // Going home when idle, and the watchdog
+    // ======================================================================
+
+    /** After idle_home_minutes without a touch, back to the start page (once per idle spell). */
+    private void checkIdleHome() {
+        Options o = options();
+        if (o.idleHomeMinutes <= 0 || web == null) return;
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastTouch < o.idleHomeMinutes * MINUTE_MS) return;
+        lastTouch = now;
+        closeHelp();
+        if (offline.showing() || atHome()) return;
+        managed.addEvent("idle_home", Json.obj("url", web.getUrl()));
+        loadHome();
+    }
+
+    private boolean atHome() {
+        if (onTemporaryPage) return false;
+        String url = web.getUrl();
+        if (sameUrl(url, homeUrl()) || sameUrl(url, homeLanded)) return true;
+        for (String u : options().playlistUrls) if (sameUrl(url, u)) return true;
+        return false;
+    }
+
+    private static boolean sameUrl(String a, String b) {
+        return a != null && b != null && trimUrl(a).equals(trimUrl(b));
+    }
+
+    private static String trimUrl(String u) {
+        int hash = u.indexOf('#');
+        if (hash >= 0) u = u.substring(0, hash);
+        while (u.endsWith("/")) u = u.substring(0, u.length() - 1);
+        return u;
+    }
+
+    /**
+     * Asks the page for a trivial bit of JavaScript. A page that doesn't answer within
+     * watchdog_minutes is frozen: reload it, and if that doesn't help, rebuild the WebView.
+     */
+    private void watchdog() {
+        Options o = options();
+        if (o.watchdogMinutes <= 0 || web == null || !resumed) {
+            heartbeatPending = false;
+            return;
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (heartbeatPending) {
+            if (now - heartbeatSentAt < o.watchdogMinutes * MINUTE_MS) return;
+            heartbeatPending = false;
+            heartbeatGen++;
+            if (!watchdogReloaded) {
+                watchdogReloaded = true;
+                managed.addEvent("watchdog_reload", Json.obj("url", web.getUrl()));
+                web.reload();
+            } else {
+                managed.addEvent("watchdog_rebuild", Json.obj("url", lastLoadedUrl));
+                rebuildWebView(0);
+            }
+            return;
+        }
+        heartbeatPending = true;
+        heartbeatSentAt = now;
+        final int gen = ++heartbeatGen;
+        try {
+            web.evaluateJavascript("1", new ValueCallback<String>() {
+                public void onReceiveValue(String value) {
+                    if (gen != heartbeatGen) return;
+                    heartbeatPending = false;
+                    watchdogReloaded = false;
+                }
+            });
+        } catch (Exception e) {
+            heartbeatPending = false;
+        }
+    }
+
+    // ======================================================================
+    // Local settings (unmanaged tablets)
+    // ======================================================================
+
+    /** {@code draft}: values to show again after a mistake, or null for the saved ones. */
+    private void showSettingsForm(JSONObject draft) {
+        JSONObject cur = draft != null ? draft : localOptions.toJson();
+        JSONObject scr = cur.optJSONObject("screen");
+        JSONObject media = cur.optJSONObject("media");
+        float d = getResources().getDisplayMetrics().density;
+        int pad = (int) (20 * d);
+
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(1 /* VERTICAL */);
+        form.setPadding(pad, pad / 2, pad, pad / 2);
+
+        heading(form, "Screen off at night");
+        final EditText offAt = field(form, "Off at (HH:MM, empty: never)", Json.str(scr, "off_at", ""), false);
+        final EditText onAt = field(form, "On again at (HH:MM)", Json.str(scr, "on_at", ""), false);
+        final CheckBox wakeTouch = check(form, "A touch wakes it", scr == null || scr.optBoolean("wake_on_touch", true));
+        boolean sensors = motion.available();
+        final CheckBox wakeMotion = check(form, sensors ? "Someone close by wakes it (proximity or light sensor)"
+                : "Someone close by wakes it (this tablet has no suitable sensor)",
+                scr != null && scr.optBoolean("wake_on_motion", false));
+        wakeMotion.setEnabled(sensors);
+        final EditText wakeMin = field(form, "Stays awake for (minutes)", Json.str(scr, "wake_minutes", "5"), true);
+
+        heading(form, "Dimming");
+        final EditText dimAt = field(form, "Dim from (HH:MM, empty: never)", Json.str(scr, "dim_at", ""), false);
+        final EditText dimUntil = field(form, "Until (HH:MM)", Json.str(scr, "dim_until", ""), false);
+        final EditText idleDim = field(form, "Also dim after this many minutes untouched (0: never)",
+                Json.str(scr, "idle_dim_minutes", "0"), true);
+        final EditText dimPct = field(form, "Dimmed brightness (%)", Json.str(scr, "dim_brightness", "15"), true);
+
+        heading(form, "Page");
+        final EditText idleHome = field(form, "Back to the start page after this many minutes untouched (0: never)",
+                Json.str(cur, "idle_home_minutes", "0"), true);
+        final EditText watchdogMin = field(form, "Reload a frozen page after this many minutes (0: never)",
+                Json.str(cur, "watchdog_minutes", "2"), true);
+        final CheckBox camera = check(form, "Pages may use the camera", media == null || media.optBoolean("camera", true));
+        final CheckBox mic = check(form, "Pages may use the microphone", media == null || media.optBoolean("microphone", true));
+
+        heading(form, "Playlist");
+        JSONObject pl = cur.optJSONObject("playlist");
+        StringBuilder plText = new StringBuilder();
+        org.json.JSONArray plUrls = pl == null ? null : pl.optJSONArray("urls");
+        for (int i = 0; plUrls != null && i < plUrls.length(); i++) plText.append(plUrls.optString(i, "")).append('\n');
+        final EditText playlist = field(form, "Pages to rotate through after the start page (https://, one per line)",
+                plText.toString().trim(), false);
+        playlist.setSingleLine(false);
+        playlist.setMinLines(2);
+        playlist.setInputType(0x1 | 0x10 | 0x20000 /* TEXT | URI | MULTI_LINE */);
+        final EditText plSeconds = field(form, "Show each page for (seconds)", Json.str(pl, "seconds", "60"), true);
+        final EditText plPause = field(form, "After a touch, pause the rotation for (seconds, 0: never)",
+                Json.str(pl, "pause_on_touch_seconds", "120"), true);
+
+        heading(form, "Screensaver");
+        JSONObject ss = cur.optJSONObject("screensaver");
+        final EditText ssMin = field(form, "Show a clock after this many minutes untouched (0: never)",
+                Json.str(ss, "minutes", "0"), true);
+        final EditText ssUrl = field(form, "Or show this page instead of the clock (https://, optional)", Json.str(ss, "url", ""), false);
+        ssUrl.setInputType(0x1 | 0x10 /* TEXT | URI */);
+
+        heading(form, "Sound");
+        JSONObject au = cur.optJSONObject("audio");
+        final EditText vol = field(form, "Volume (%, empty: leave it as it is)",
+                au == null || au.optInt("volume", -1) < 0 ? "" : Json.str(au, "volume", ""), true);
+        final EditText quietAt = field(form, "Quiet from (HH:MM, empty: never)", Json.str(au, "quiet_at", ""), false);
+        final EditText quietUntil = field(form, "Until (HH:MM)", Json.str(au, "quiet_until", ""), false);
+        final EditText quietVol = field(form, "Volume during quiet hours (%)", Json.str(au, "quiet_volume", "0"), true);
+
+        heading(form, "Tablet");
+        final EditText rebootAt = field(form, "Restart every day at (HH:MM, empty: never; a full reboot when device owner)",
+                Json.str(cur, "reboot_at", ""), false);
+        final CheckBox uploads = check(form, "Pages may upload files", cur.optBoolean("file_uploads", true));
+        final CheckBox forget = check(form, "Forget saved sign-ins and trusted certificates", false);
+
+        heading(form, "Battery");
+        JSONObject bat = cur.optJSONObject("battery");
+        final CheckBox protect = check(form, "Limit charging to protect the battery (Samsung, experimental; see Help)",
+                bat != null && bat.optBoolean("protect", false));
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(form, new FrameLayout.LayoutParams(-1, -2));
+
+        dialog()
+                .setTitle("Settings")
+                .setView(scroll)
+                .setPositiveButton("Save", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dlg, int which) {
+                        JSONObject o = Json.obj(
+                                "idle_home_minutes", number(idleHome, 0),
+                                "watchdog_minutes", number(watchdogMin, 2),
+                                "media", Json.obj("camera", camera.isChecked(), "microphone", mic.isChecked()),
+                                "screen", Json.obj(
+                                        "off_at", text(offAt), "on_at", text(onAt),
+                                        "wake_on_touch", wakeTouch.isChecked(),
+                                        "wake_on_motion", wakeMotion.isChecked(),
+                                        "wake_minutes", number(wakeMin, 5),
+                                        "dim_at", text(dimAt), "dim_until", text(dimUntil),
+                                        "dim_brightness", number(dimPct, 15),
+                                        "idle_dim_minutes", number(idleDim, 0)),
+                                "battery", Json.obj("protect", protect.isChecked()),
+                                "playlist", Json.obj("urls", lines(playlist), "seconds", number(plSeconds, 60),
+                                        "pause_on_touch_seconds", number(plPause, 120)),
+                                "screensaver", Json.obj("minutes", number(ssMin, 0), "url", text(ssUrl)),
+                                "audio", Json.obj("volume", text(vol).length() == 0 ? -1 : number(vol, -1),
+                                        "quiet_at", text(quietAt), "quiet_until", text(quietUntil),
+                                        "quiet_volume", number(quietVol, 0)),
+                                "file_uploads", uploads.isChecked(),
+                                "reboot_at", text(rebootAt));
+                        String problem = timesProblem(text(offAt), text(onAt), "off")
+                                + timesProblem(text(dimAt), text(dimUntil), "dimming")
+                                + timesProblem(text(quietAt), text(quietUntil), "quiet hours");
+                        if (text(rebootAt).length() > 0 && Options.time(text(rebootAt)) < 0) {
+                            problem += "\"" + text(rebootAt) + "\" isn't a time. Use HH:MM, like 04:00. ";
+                        }
+                        org.json.JSONArray urls = lines(playlist);
+                        for (int i = 0; i < urls.length(); i++) {
+                            if (!urls.optString(i, "").startsWith("https://")) {
+                                problem += "Playlist pages must start with https://. ";
+                                break;
+                            }
+                        }
+                        if (text(ssUrl).length() > 0 && !text(ssUrl).startsWith("https://")) {
+                            problem += "The screensaver page must start with https://. ";
+                        }
+                        if (problem.length() > 0) {
+                            toast(problem.trim());
+                            showSettingsForm(o);
+                            return;
+                        }
+                        Options.saveLocal(MainActivity.this, o);
+                        if (forget.isChecked()) Trust.forgetLocal(MainActivity.this);
+                        localOptions = Options.local(MainActivity.this);
+                        appliedVolume = -2;
+                        applyVolume();
+                        schedulePlaylist();
+                        lastTouch = lastActivity = SystemClock.elapsedRealtime();
+                        updateScreen();
+                        checkBattery();
+                        if ("no_permission".equals(batteryProtect)) {
+                            toast("Settings saved. Limiting charging needs a one-time adb command (see Help)");
+                        } else if ("unsupported".equals(batteryProtect)) {
+                            toast("Settings saved. This tablet has no charging limit Kiosky can use");
+                        } else {
+                            toast("Settings saved");
+                        }
+                    }
+                })
+                .setNeutralButton(localPin() == null ? "Set a PIN…" : "PIN…", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dlg, int which) {
+                        pinTapped();
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /** Empty, or a sentence about what's wrong with a pair of times. */
+    private static String timesProblem(String from, String to, String what) {
+        if (from.length() == 0 && to.length() == 0) return "";
+        if (from.length() == 0 || to.length() == 0) return "Set both times for " + what + ", or neither. ";
+        if (Options.time(from) < 0) return "\"" + from + "\" isn't a time. Use HH:MM, like 22:30. ";
+        if (Options.time(to) < 0) return "\"" + to + "\" isn't a time. Use HH:MM, like 07:00. ";
+        if (Options.time(from) == Options.time(to)) return "The " + what + " times can't be the same. ";
+        return "";
+    }
+
+    private void heading(LinearLayout form, String label) {
+        TextView t = new TextView(this);
+        t.setText(label);
+        t.setTextSize(18);
+        t.setPadding(0, (int) (16 * getResources().getDisplayMetrics().density), 0, 0);
+        form.addView(t, new LinearLayout.LayoutParams(-1, -2));
+    }
+
+    private EditText field(LinearLayout form, String label, String value, boolean numeric) {
+        TextView t = new TextView(this);
+        t.setText(label);
+        form.addView(t, new LinearLayout.LayoutParams(-1, -2));
+        EditText e = new EditText(this);
+        e.setSingleLine(true);
+        e.setInputType(numeric ? 0x2 /* TYPE_CLASS_NUMBER */ : 0x4 | 0x20 /* TYPE_CLASS_DATETIME | TIME */);
+        e.setText(value);
+        form.addView(e, new LinearLayout.LayoutParams(-1, -2));
+        return e;
+    }
+
+    private CheckBox check(LinearLayout form, String label, boolean on) {
+        CheckBox c = new CheckBox(this);
+        c.setText(label);
+        c.setChecked(on);
+        form.addView(c, new LinearLayout.LayoutParams(-1, -2));
+        return c;
+    }
+
+    private static String text(EditText e) {
+        return e.getText() == null ? "" : e.getText().toString().trim();
+    }
+
+    private static org.json.JSONArray lines(EditText e) {
+        org.json.JSONArray a = new org.json.JSONArray();
+        for (String l : text(e).split("[\\s]+")) if (l.length() > 0) a.put(l);
+        return a;
+    }
+
+    private static int number(EditText e, int def) {
+        try {
+            return Integer.parseInt(text(e));
+        } catch (NumberFormatException x) {
+            return def;
+        }
+    }
+
+    // ---- Settings PIN ------------------------------------------------------
+
+    private JSONObject localPin() {
+        return Json.parse(getSharedPreferences(PREFS, 0).getString(KEY_PIN, null));
+    }
+
+    /** An unmanaged tablet whose toolbar asks for a PIN. */
+    private boolean localPinSet() {
+        return policy == null && localPin() != null;
+    }
+
+    private void pinTapped() {
+        if (localPin() == null) {
+            askNewPin();
+            return;
+        }
+        dialog()
+                .setTitle("Settings PIN")
+                .setMessage("Kiosky's toolbar asks for this PIN before it opens.")
+                .setPositiveButton("Change PIN", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) {
+                        askNewPin();
+                    }
+                })
+                .setNeutralButton("Remove PIN", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface d, int w) {
+                        getSharedPreferences(PREFS, 0).edit().remove(KEY_PIN).apply();
+                        refreshToolbar();
+                        toast("The toolbar opens without a PIN again");
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void askNewPin() {
+        float d = getResources().getDisplayMetrics().density;
+        int pad = (int) (20 * d);
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(1 /* VERTICAL */);
+        form.setPadding(pad, pad / 2, pad, 0);
+        final EditText first = new EditText(this);
+        first.setInputType(0x12 /* NUMBER | NUMBER_VARIATION_PASSWORD */);
+        first.setHint("New PIN (4 to 12 digits)");
+        form.addView(first, new LinearLayout.LayoutParams(-1, -2));
+        final EditText second = new EditText(this);
+        second.setInputType(0x12);
+        second.setHint("Same PIN again");
+        form.addView(second, new LinearLayout.LayoutParams(-1, -2));
+
+        dialog()
+                .setTitle("Set a settings PIN")
+                .setMessage("Opening Kiosky's toolbar will need this PIN. If it's forgotten, the only way back "
+                        + "is clearing Kiosky's storage in Android's settings, which also forgets the address and sign-ins.")
+                .setView(form)
+                .setPositiveButton("Save", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dlg, int which) {
+                        final String pin = text(first);
+                        if (!pin.matches("[0-9]{4,12}")) {
+                            toast("Use 4 to 12 digits");
+                            return;
+                        }
+                        if (!pin.equals(text(second))) {
+                            toast("The two PINs don't match");
+                            return;
+                        }
+                        toast("Saving the PIN…");
+                        new Thread(new Runnable() {
+                            public void run() {
+                                final JSONObject spec = Pin.create(pin); // slow by design
+                                handler.post(new Runnable() {
+                                    public void run() {
+                                        if (spec == null) {
+                                            toast("Couldn't save the PIN");
+                                            return;
+                                        }
+                                        getSharedPreferences(PREFS, 0).edit().putString(KEY_PIN, spec.toString()).apply();
+                                        refreshToolbar();
+                                        toast("PIN set. Kiosky's toolbar will ask for it");
+                                    }
+                                });
+                            }
+                        }).start();
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     // ======================================================================
@@ -1215,7 +2809,7 @@ public class MainActivity extends Activity {
         labels.add("• For full lockdown on any Android version, make Kiosky the device owner (tap for help)");
         actions.add(new Runnable() {
             public void run() {
-                showHelp();
+                showHelpOverlay();
                 dismissToolbar();
             }
         });
@@ -1262,10 +2856,16 @@ public class MainActivity extends Activity {
 
     /** All of Kiosky's dialogs go through here, so they aren't mistaken for the shade. */
     private AlertDialog.Builder dialog() {
+        return dialog(null);
+    }
+
+    /** {@code onDismiss} runs however the dialog closes (a button, Back, or a timeout). */
+    private AlertDialog.Builder dialog(final Runnable onDismiss) {
         ownDialogs++;
         return new AlertDialog.Builder(this).setOnDismissListener(new DialogInterface.OnDismissListener() {
             public void onDismiss(DialogInterface d) {
                 if (ownDialogs > 0) ownDialogs--;
+                if (onDismiss != null) onDismiss.run();
             }
         });
     }
@@ -1325,30 +2925,40 @@ public class MainActivity extends Activity {
     // Technician PIN (§5.3)
     // ======================================================================
 
+    /** Managed: the technician PIN (§5.3). Unmanaged: the local settings PIN. */
     private void showPinPad() {
-        if (policy == null || policy.pin == null) return;
+        final JSONObject spec = policy != null ? policy.pin : localPin();
+        if (spec == null || pinPadOpen) return;
         long wait = pinLockedUntil - System.currentTimeMillis();
         if (wait > 0) {
             toast("Too many wrong PINs. Try again in " + ((wait + 59999) / 60000) + " min");
             return;
         }
+        pinPadOpen = true;
         final EditText field = new EditText(this);
         field.setInputType(0x12 /* TYPE_CLASS_NUMBER | TYPE_NUMBER_VARIATION_PASSWORD */);
         field.setHint("PIN");
-        dialog()
-                .setTitle("Technician PIN")
+        dialog(new Runnable() {
+            public void run() {
+                pinPadOpen = false;
+            }
+        })
+                .setTitle(policy != null ? "Technician PIN" : "Settings PIN")
                 .setView(field)
                 .setPositiveButton("Unlock", new DialogInterface.OnClickListener() {
                     public void onClick(DialogInterface dlg, int which) {
-                        checkPin(field.getText().toString());
+                        checkPin(field.getText().toString(), spec);
                     }
                 })
-                .setNegativeButton("Cancel", null)
+                .setNegativeButton("Cancel", new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dlg, int which) {
+                        afterUnlock = null;
+                    }
+                })
                 .show();
     }
 
-    private void checkPin(final String entered) {
-        final JSONObject spec = policy.pin;
+    private void checkPin(final String entered, final JSONObject spec) {
         new Thread(new Runnable() {
             public void run() {
                 final boolean ok = Pin.verify(entered, spec); // slow by design
@@ -1357,14 +2967,23 @@ public class MainActivity extends Activity {
                         if (ok) {
                             pinFails = 0;
                             unlocked = true;
-                            showUrlBar();
-                            if (shepherd.lastError != null) toast(shepherd.lastError);
+                            Runnable then = afterUnlock;
+                            afterUnlock = null;
+                            if (then != null) {
+                                unlocked = false; // only for this action, not the toolbar
+                                then.run();
+                            } else {
+                                showUrlBar();
+                            }
+                            if (policy != null && shepherd.lastError != null) toast(shepherd.lastError);
                         } else if (++pinFails >= MAX_PIN_TRIES) {
                             pinFails = 0;
+                            afterUnlock = null;
                             pinLockedUntil = System.currentTimeMillis() + PIN_LOCKOUT_MS;
                             managed.addEvent("pin_failed", Json.obj("attempts", MAX_PIN_TRIES));
                             toast("Too many wrong PINs. PIN entry is locked for 5 minutes");
                         } else {
+                            afterUnlock = null;
                             toast("Wrong PIN");
                         }
                     }
@@ -1408,10 +3027,19 @@ public class MainActivity extends Activity {
         if ("kiosky".equals(u.getScheme()) && "enroll".equals(u.getHost())) handleEnrollUri(u);
     }
 
-    private void handleEnrollUri(Uri u) {
+    private void handleEnrollUri(final Uri u) {
         if (policy != null) {
             // Never re-enroll a managed tablet: that would be a way out of lockdown
             toast("This tablet is already managed by " + policy.organisation);
+            return;
+        }
+        if (localPinSet() && !unlocked) { // handing the tablet over needs the settings PIN
+            afterUnlock = new Runnable() {
+                public void run() {
+                    confirmEnroll(u.getQueryParameter("server"), u.getQueryParameter("token"));
+                }
+            };
+            showPinPad();
             return;
         }
         confirmEnroll(u.getQueryParameter("server"), u.getQueryParameter("token"));

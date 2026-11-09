@@ -5,9 +5,23 @@ set -euo pipefail
 
 P="$(cd "$(dirname "$0")" && pwd)"
 T="$P/.tools"
-KS="$P/kiosky.keystore"
-KS_ALIAS="ha"
-KS_PASS="halp0kiosk"
+
+# Signing keys live outside the repo (see "Signing" in README.md). Set the KIOSKY_*
+# variables yourself, or keep them in ~/.kiosky/release.env.
+ENV_FILE="${KIOSKY_SIGNING_ENV:-$HOME/.kiosky/release.env}"
+if [ -z "${KIOSKY_KEYSTORE:-}" ] && [ -f "$ENV_FILE" ]; then
+  set -a; . "$ENV_FILE"; set +a
+fi
+LINEAGE="$P/signing/kiosky.lineage"
+for v in KIOSKY_KEYSTORE KIOSKY_KEY_ALIAS KIOSKY_KEYSTORE_PASS KIOSKY_LEGACY_KEYSTORE KIOSKY_LEGACY_ALIAS KIOSKY_LEGACY_PASS; do
+  if [ -z "${!v:-}" ]; then
+    echo "$v isn't set. Put the signing keys in $ENV_FILE (see README.md, Signing)." >&2
+    exit 1
+  fi
+done
+for f in "$KIOSKY_KEYSTORE" "$KIOSKY_LEGACY_KEYSTORE" "$LINEAGE"; do
+  [ -f "$f" ] || { echo "Missing $f. Never generate a new key here: installed tablets only accept updates from the same keys." >&2; exit 1; }
+done
 
 mkdir -p "$T"
 [ -f "$T/apktool.jar" ] || curl -fsSL -o "$T/apktool.jar" \
@@ -33,15 +47,18 @@ sh "$D2J/d2j-jar2dex.sh" -f -o "$P/app/classes.dex" "$P/build/app.jar"
 # Manifest + resources + dex -> unsigned APK
 java -jar "$T/apktool.jar" b -f "$P/app" -o "$P/build/unsigned.apk"
 
-# Signing key (created once; keep it, updates must use the same key)
-if [ ! -f "$KS" ]; then
-  keytool -genkeypair -keystore "$KS" -alias "$KS_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
-    -storepass "$KS_PASS" -keypass "$KS_PASS" -dname "CN=kiosky"
-fi
+# 1. zipalign (uber-apk-signer also signs, with the legacy key; step 2 replaces that)
+java -jar "$T/signer.jar" -a "$P/build/unsigned.apk" -o "$P/build/aligned" \
+  --ks "$KIOSKY_LEGACY_KEYSTORE" --ksAlias "$KIOSKY_LEGACY_ALIAS" \
+  --ksPass "$KIOSKY_LEGACY_PASS" --ksKeyPass "$KIOSKY_LEGACY_PASS" >/dev/null
 
-# zipalign + v1/v2/v3 signature
-java -jar "$T/signer.jar" -a "$P/build/unsigned.apk" -o "$P/build/out" \
-  --ks "$KS" --ksAlias "$KS_ALIAS" --ksPass "$KS_PASS" --ksKeyPass "$KS_PASS"
+# 2. Signatures: v1/v2 with the legacy key (Android 5.1–8.1 only know that one), v3 with
+#    the release key plus the proof of rotation, from Android 9 (see tools/Sign.java)
+mkdir -p "$P/build/out"
+java -cp "$T/signer.jar" "$P/tools/Sign.java" "$(ls "$P"/build/aligned/*.apk)" "$P/build/out/kiosky.apk" "$LINEAGE"
+
+# 3. Check alignment and signatures
+java -jar "$T/signer.jar" -a "$P/build/out/kiosky.apk" --onlyVerify | grep -E "verified|ERROR|FAIL" || true
 
 cp "$P"/build/out/*.apk "$P/kiosky.apk"
 rm -f "$P/app/classes.dex"

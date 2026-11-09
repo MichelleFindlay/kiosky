@@ -14,7 +14,8 @@ final class Pages {
 
     private Pages() {}
 
-    static String help(Context c) {
+    /** {@code start}: shown as the start page, with the arrow pointing at the swipe edge. */
+    static String help(Context c, boolean start) {
         String body;
         try {
             body = Markdown.toHtml(readAsset(c, "help.md").replace("{{version}}", Updater.currentVersion(c)));
@@ -22,7 +23,8 @@ final class Pages {
             body = "<h1>Kiosky</h1><p>The help page couldn't be loaded. Swipe in from the top "
                     + "or bottom edge to open the toolbar and enter an address.</p>";
         }
-        return page("Kiosky help", HELP_ARROW + "<main>" + body + "</main>");
+        return page("Kiosky help", start ? HELP_ARROW + "<main>" + body + "</main>"
+                : "<main class=\"plain\">" + body + "</main>");
     }
 
     /** Shown on a managed tablet whose policy has no start page yet. */
@@ -100,5 +102,5 @@ final class Pages {
             + "th{color:var(--muted);font-size:.85em;text-transform:uppercase;letter-spacing:.04em}"
             + "tr:last-child td{border-bottom:0}hr{border:0;border-top:1px solid var(--line);margin:2rem 0}"
             + ".center{text-align:center;padding-top:20vh}.center img{margin:0 auto 1.25rem!important}"
-            + ".muted{color:var(--muted)}";
+            + ".muted{color:var(--muted)}main.plain{padding-top:2rem}";
 }

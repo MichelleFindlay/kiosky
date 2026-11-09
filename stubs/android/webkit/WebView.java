@@ -6,4 +6,5 @@ public class WebView extends android.widget.AbsoluteLayout {
  public void clearCache(boolean b){} public void clearHistory(){}
  public void reload(){} public boolean canGoBack(){return false;} public void goBack(){} public void onResume(){} public void onPause(){}
  public void destroy(){} public void setWebViewClient(WebViewClient c){} public void setWebChromeClient(WebChromeClient c){}
+ public void evaluateJavascript(String s,ValueCallback<String> cb){} public void addJavascriptInterface(Object o,String n){}
  public WebBackForwardList saveState(Bundle b){return null;} public WebBackForwardList restoreState(Bundle b){return null;} }

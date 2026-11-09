@@ -32,7 +32,8 @@ the web page instead.
 | --- | --- |
 | **Go** | Opens the address in the box and saves it as your page |
 | **Reload** | Reloads the current page |
-| **Help** | Shows this page (your saved address isn't changed) |
+| **Help** | Shows this page over yours. **Close** (or Back) returns to your page, which stays loaded underneath |
+| **Settings** | Night schedule, dimming, going back to the start page, camera and microphone, and the settings PIN (see *Settings*) |
 | **Update** | Checks for a newer version of Kiosky |
 | **Start on boot** | Turns opening Kiosky automatically at start-up on or off |
 | **Enroll** | Hands this tablet to a Shepherd management server (see below) |
@@ -41,6 +42,154 @@ the web page instead.
 | **✕** | Hides the toolbar |
 
 The toolbar hides itself after 15 seconds unless you're typing in it.
+
+## Settings
+
+Tap **Settings** in the toolbar. Everything here is optional; leave a time empty to
+turn that part off.
+
+### Screen off at night
+
+Set **Off at** and **On again at** (24-hour `HH:MM`, for example `23:00` and
+`06:30`). The times can wrap past midnight. In between, the screen goes black.
+
+- **A touch wakes it**: the first touch only wakes the screen and doesn't press
+  anything on the page. It stays on for **Stays awake for** minutes, then goes dark
+  again.
+- **Someone close by wakes it**: uses the tablet's proximity sensor (a hand near the
+  top edge) or light sensor (a room light switched on). Not every tablet has one.
+- If neither is ticked, Kiosky lets the screen switch off properly and turns it back
+  on at the *On again* time. **Five quick taps** anywhere still wake it, so you
+  can always get back in.
+
+When the off hours end, Kiosky reloads the page so it's fresh.
+
+### Dimming
+
+**Dim from** and **Until** lower the brightness for part of the day, to the
+**Dimmed brightness** percentage. **Also dim after this many minutes untouched**
+dims the screen whenever nobody has used it for a while. The first touch brightens
+it again without pressing anything.
+
+### Page
+
+- **Back to the start page after this many minutes untouched**: if someone taps
+  into another page and walks away, Kiosky goes back to your page by itself.
+- **Reload a frozen page after this many minutes**: Kiosky checks every few
+  seconds that the page still responds. If it stops for this long, Kiosky reloads
+  it, and if that doesn't help, starts it again from scratch. On by default (2
+  minutes).
+- **Pages may use the camera / microphone**: see *Camera and microphone*.
+
+### Playlist
+
+List more pages (one `https://` address per line) to rotate through after your
+start page, each shown for **Show each page for** seconds. A touch pauses the
+rotation for a while, so someone using a page isn't interrupted.
+
+### Screensaver
+
+After **Show a clock after this many minutes untouched**, a large clock and date
+drift slowly around a black screen (so nothing burns in). Give a page address to
+show that instead, such as a photo frame. The first touch closes it without
+pressing anything.
+
+### Sound
+
+**Volume** sets the media volume (leave it empty to use the tablet's own).
+**Quiet from** and **Until** lower it, or mute it at `0`, for part of the day.
+Kiosky only changes the volume when the wanted level changes, so someone can
+still turn it up or down by hand until the next change.
+
+### Tablet
+
+- **Restart every day at**: a fresh start each day (for example `04:00`) clears
+  slow memory leaks in long-running dashboards. As device owner (Android 7+) it's
+  a full reboot; otherwise Kiosky restarts itself.
+- **Pages may upload files**: lets "choose file" buttons open Android's file
+  picker. Turn it off on public tablets that don't need it.
+- **Forget saved sign-ins and trusted certificates**: see *Sign-ins and
+  certificates*.
+
+### Settings PIN
+
+Tap **Set a PIN…** at the bottom of Settings. After that, swiping in from an edge
+(or the five corner taps) asks for the PIN before the toolbar opens, the Back button
+no longer closes Kiosky, and enrollment links need the PIN too. Use **PIN…** to
+change or remove it.
+
+> If the PIN is forgotten, the only way back is Settings › Apps › Kiosky › Storage ›
+> **Clear storage** (or `adb shell pm clear uk.lp0.ha`). That also forgets the
+> address and sign-ins.
+
+## Camera and microphone
+
+Video doorbells, intercoms and two-way audio (for example in Home Assistant or
+Frigate) need the camera or microphone. When a page asks:
+
+- Your own page's site gets them straight away. The first time, Android asks you to
+  allow Kiosky to use the camera or microphone. As device owner, Kiosky grants that
+  itself.
+- Any other site asks once (**Allow** or **Block**), and a yes is remembered.
+- Untick **Pages may use the camera** or **microphone** in Settings to refuse them
+  everywhere.
+
+Only `https://` pages can use them.
+
+### Controlling the tablet from a dashboard
+
+Pages can use `window.kiosky` in JavaScript, for example from a motion-sensor
+automation on a Home Assistant dashboard:
+
+| Call | What it does |
+| --- | --- |
+| `kiosky.wake()` | Wakes the screen (any page) |
+| `kiosky.isScreenOff()` | `true` while the screen is off |
+| `kiosky.version()` | Kiosky's version |
+| `kiosky.reload()` | Reloads the page |
+| `kiosky.setBrightness(30)` | Sets the brightness in percent; `0` goes back to the tablet's own |
+| `kiosky.screenOff()` | Blacks the screen out until the next touch or `wake()` |
+| `kiosky.deviceName()` | The tablet's name in Shepherd |
+
+Everything below `version()` only works for your own page's site (on a managed
+tablet: the start page's site and the allowed sites), and returns `false` (or an
+empty name) anywhere else.
+
+## Sign-ins and certificates
+
+**Username and password prompts.** Some pages (behind a proxy, or older devices)
+ask for a username and password in a browser box. Kiosky asks once and, with
+**Remember on this tablet** ticked, signs in by itself after that. The details
+are stored on the tablet unencrypted, so use an account that can only view the
+dashboard.
+
+**Self-signed certificates.** A server on your own network (Home Assistant, a NAS)
+often has a certificate Android doesn't trust. Kiosky shows its SHA-256
+fingerprint and asks whether to trust it; a yes is remembered for that site only.
+If you didn't expect the question for a site, choose **Don't trust**.
+
+To clear both, tick **Forget saved sign-ins and trusted certificates** in Settings.
+On a managed tablet, both come from the server instead (*HTTP sign-in* and
+*Trusted certificates*); an untrusted certificate shows its fingerprint on screen
+and in Shepherd, ready to copy.
+
+## Battery care
+
+Tablets left on charge all the time wear their batteries out and can make them
+swell. Kiosky reports the battery's temperature and health to Shepherd, which can
+alert you when it runs hot.
+
+**Limit charging to protect the battery** (in Settings) turns on the tablet's own
+charging limit. Android has no general way for apps to do this, so it's
+experimental and only works on Samsung tablets that have *Protect battery*
+(charging stops at about 85%). It needs a one-time command from a computer with
+adb:
+
+`adb shell pm grant uk.lp0.ha android.permission.WRITE_SECURE_SETTINGS`
+
+Without it, Kiosky can't change the setting; you can still turn *Protect battery*
+on by hand in Settings › Battery. Kiosky only turns the limit off again if it
+was the one that turned it on.
 
 ## Updates
 
@@ -125,7 +274,12 @@ which works up to Android 11 without the helper.
 
 ### Make Kiosky the device owner
 
-This is done once per tablet, from a computer with
+**Easiest, with Kiosky Shepherd:** factory-reset the tablet, tap six times in the
+same spot on its first setup screen, and scan the enrollment code's
+**Provisioning QR** from the Shepherd console. The tablet joins Wi-Fi, installs
+Kiosky as the device owner and enrolls by itself.
+
+Otherwise, it's done once per tablet, from a computer with
 [adb](https://developer.android.com/tools/adb):
 
 1. On the tablet, remove every account in Settings › Accounts (Android refuses
@@ -174,8 +328,16 @@ already managed ignores enrollment links and codes.
 - Only sites the administrator allows can open.
 - Updates, start on boot, screen orientation, text size and similar settings
   come from the server.
-- The server can reload the page, show a message, take a screenshot, clear
-  sign-ins or restart Kiosky.
+- The server can reload the page, show a message or read one aloud, take a
+  screenshot or watch the screen live, collect diagnostics, clear sign-ins, wake
+  the screen, or restart Kiosky (or reboot the tablet, as device owner).
+- If Kiosky ever crashes, it tells the server what went wrong when it next starts.
+- The night schedule, dimming, playlist, screensaver, sound, daily restart, going
+  back to the start page, the frozen-page check, file uploads, sign-ins,
+  certificates and camera and microphone access come from the server, so
+  **Settings** is hidden.
+  Camera and microphone only work for the start page's site and the sites the
+  administrator allows by name.
 - Kiosky reports the page it's showing, any loading errors, battery, Wi-Fi
   signal and whether start-on-boot and update permissions are granted.
 
@@ -195,25 +357,37 @@ missing permissions. After five wrong PINs, PIN entry is locked for 5 minutes.
 - **Logins are kept.** Cookies and site storage are saved, so you stay signed
   in after restarting the app or the tablet.
 - **Lost connection?** If the page can't be reached (Wi-Fi waking up, server
-  restarting), Kiosky tries again every 10 seconds on its own.
+  restarting), Kiosky shows a *Reconnecting…* screen with the time and tries
+  again every 10 seconds on its own. That includes servers answering with an error
+  while they start, like Home Assistant's *502 Bad Gateway*. Tap **Try now** to
+  retry straight away.
+- **Page crashed?** If the page's renderer crashes or Android stops it to free
+  memory, Kiosky starts it again on its own instead of closing.
+- **Pop-ups close themselves.** A page's `alert()`, `confirm()` or `prompt()` box
+  closes after 30 seconds (as OK for alerts, Cancel for the others), so a stray
+  pop-up can't leave the panel stuck.
 - **Links stay inside Kiosky.** Nothing opens in another app or browser.
 - **Notification shade:** whenever Kiosky is on screen, it stops people pulling
   down the notification shade, even with Lockdown off. As device owner the shade
   is turned off completely. Otherwise Kiosky closes it as soon as it opens: by
   itself up to Android 11, and with the accessibility helper on Android 12 and
   later (see *Lock the tablet down*).
-- **Screen stays on** while Kiosky is open. To dim it at night, use the
-  tablet's own schedule or your dashboard's settings.
+- **Screen stays on** while Kiosky is open. To dim it or switch it off at night,
+  use **Settings** (see *Settings*).
 - **Sound and video** can play without a tap first, which suits cameras and
   doorbells on a dashboard.
-- **Back button:** hides the toolbar if it's showing, otherwise goes back a
-  page. On the first page, it closes Kiosky.
-- **Back to this page:** open the toolbar and tap **Help**. To make this page
-  the start page again, clear the address box and tap **Go**.
+- **Back button:** hides the toolbar or this help if either is showing,
+  otherwise goes back a page. On the first page, it closes Kiosky, unless a
+  settings PIN is set or Lockdown is on.
+- **Back to this page:** open the toolbar and tap **Help**. It opens over your
+  page and never replaces it. To make this page the start page instead, clear
+  the address box and tap **Go**.
 
 ## Tips for a wall-mounted tablet
 
-- **Keep people in Kiosky:** turn on **Lockdown** (see *Lock the tablet down*).
+- **Keep people in Kiosky:** turn on **Lockdown** (see *Lock the tablet down*),
+  and set a **settings PIN** so the toolbar can't be used to change things.
+- **Save the screen at night:** set a night schedule in **Settings**.
 - **Stop Android closing it:** set Kiosky's battery use to *Unrestricted* in
   Settings › Apps › Kiosky › Battery.
 - **Leave it charging.** The screen stays on, so it uses more power than usual.

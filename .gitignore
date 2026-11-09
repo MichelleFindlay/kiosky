@@ -1,2 +1,7 @@
 /build/
 /.tools/
+
+# Signing keys never go in the repo (see README.md, Signing)
+*.keystore
+*.jks
+release.env
